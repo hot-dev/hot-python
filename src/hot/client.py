@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Self
+from typing import Any
 
 import httpx
 
@@ -85,7 +85,7 @@ class HotClient:
     def close(self) -> None:
         self._transport.close()
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> HotClient:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -147,7 +147,7 @@ class AsyncHotClient:
     async def aclose(self) -> None:
         await self._transport.aclose()
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> AsyncHotClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
