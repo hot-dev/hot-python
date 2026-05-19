@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hot-dev"
+version = "1.1.0"
+description = "Python SDK for the Hot Dev API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+  { name = "Hot Dev, LLC" },
+]
+keywords = [
+  "hot",
+  "hot-dev",
+  "sdk",
+  "api",
+  "agents",
+  "streaming",
+]
+dependencies = [
+  "httpx>=0.28",
+]
+
+[project.urls]
+Homepage = "https://hot.dev"
+Repository = "https://github.com/hot-dev/hot-python"
+Issues = "https://github.com/hot-dev/hot-python/issues"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8.0",
+  "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hot"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
