@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 from urllib.parse import quote
 
@@ -30,12 +30,81 @@ def _run_id_of(event: Any) -> str | None:
     return None
 
 
+def _event_id_of_run(run: Any) -> str | None:
+    if not isinstance(run, dict):
+        return None
+    event_id = run.get("event_id")
+    return event_id if isinstance(event_id, str) else None
+
+
+def _result_message(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if not isinstance(value, dict):
+        return None
+    for key in ("$err", "error", "message", "reason"):
+        message = _result_message(value.get(key))
+        if message:
+            return message
+    return None
+
+
+def _run_result_message(run: Mapping[str, Any], fallback: str) -> str:
+    message = _result_message(run.get("result"))
+    if message:
+        return message
+    status = run.get("status")
+    return f"{fallback} ({status})" if isinstance(status, str) and status else fallback
+
+
+def _extract_run_result(result: Any) -> Any:
+    if isinstance(result, dict) and "$ok" in result:
+        return result["$ok"]
+    return result
+
+
+def _emit_chunk(event: StreamEvent, on_chunk: Callable[[str], None] | None) -> None:
+    if not on_chunk or event.get("type") != "stream:data":
+        return
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        text = payload.get("text")
+        if isinstance(text, str):
+            on_chunk(text)
+
+
 class EventsResource:
     def __init__(self, transport: SyncTransport) -> None:
         self._transport = transport
 
     def publish(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._transport.request_json("POST", "/events", json=dict(body))["data"]
+
+    def call_hot(
+        self,
+        fn: str,
+        args: list[Any] | None = None,
+        *,
+        timeout: float = 60.0,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> Any:
+        published = self.publish(
+            {
+                "event_type": "hot:call",
+                "event_data": {
+                    "fn": fn,
+                    "args": args or [],
+                },
+            }
+        )
+        run = wait_for_run_result(
+            self._transport,
+            published["stream_id"],
+            published["event_id"],
+            timeout=timeout,
+            on_chunk=on_chunk,
+        )
+        return _extract_run_result(run.get("result"))
 
     def list(self, **query: Any) -> dict[str, Any]:
         return self._transport.request_json("GET", "/events", params=query)
@@ -103,6 +172,22 @@ class StreamsResource:
             "POST",
             f"/streams/{enc(stream_id)}/subscribe",
             params={"project": project},
+        )
+
+    def wait_for_run_result(
+        self,
+        stream_id: str,
+        event_id: str,
+        *,
+        timeout: float = 60.0,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        return wait_for_run_result(
+            self._transport,
+            stream_id,
+            event_id,
+            timeout=timeout,
+            on_chunk=on_chunk,
         )
 
     def subscribe_with_event(
@@ -471,12 +556,112 @@ def iter_stream(
         yield from events
 
 
+def wait_for_run_result(
+    transport: SyncTransport,
+    stream_id: str,
+    event_id: str,
+    *,
+    timeout: float = 60.0,
+    on_chunk: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    current_run_id: str | None = None
+
+    for event in iter_stream(transport, "GET", f"/streams/{enc(stream_id)}/subscribe"):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Timeout waiting for run result")
+
+        if event.get("type") == "run:start":
+            run = event.get("run")
+            if _event_id_of_run(run) == event_id:
+                current_run_id = _run_id_of(event)
+
+        if current_run_id and event.get("type") == "stream:data":
+            if event.get("run_id") == current_run_id:
+                _emit_chunk(event, on_chunk)
+
+        if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
+            run = event.get("run")
+            if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
+                continue
+            if event.get("type") == "run:fail":
+                raise RuntimeError(_run_result_message(run, "Run failed"))
+            if event.get("type") == "run:cancel":
+                raise RuntimeError(_run_result_message(run, "Run cancelled"))
+            return run
+
+    raise RuntimeError("Stream ended before run completed")
+
+
+async def async_wait_for_run_result(
+    transport: AsyncTransport,
+    stream_id: str,
+    event_id: str,
+    *,
+    timeout: float = 60.0,
+    on_chunk: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    current_run_id: str | None = None
+
+    async for event in aiter_stream(transport, "GET", f"/streams/{enc(stream_id)}/subscribe"):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Timeout waiting for run result")
+
+        if event.get("type") == "run:start":
+            run = event.get("run")
+            if _event_id_of_run(run) == event_id:
+                current_run_id = _run_id_of(event)
+
+        if current_run_id and event.get("type") == "stream:data":
+            if event.get("run_id") == current_run_id:
+                _emit_chunk(event, on_chunk)
+
+        if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
+            run = event.get("run")
+            if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
+                continue
+            if event.get("type") == "run:fail":
+                raise RuntimeError(_run_result_message(run, "Run failed"))
+            if event.get("type") == "run:cancel":
+                raise RuntimeError(_run_result_message(run, "Run cancelled"))
+            return run
+
+    raise RuntimeError("Stream ended before run completed")
+
+
 class AsyncEventsResource:
     def __init__(self, transport: AsyncTransport) -> None:
         self._transport = transport
 
     async def publish(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return (await self._transport.request_json("POST", "/events", json=dict(body)))["data"]
+
+    async def call_hot(
+        self,
+        fn: str,
+        args: list[Any] | None = None,
+        *,
+        timeout: float = 60.0,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> Any:
+        published = await self.publish(
+            {
+                "event_type": "hot:call",
+                "event_data": {
+                    "fn": fn,
+                    "args": args or [],
+                },
+            }
+        )
+        run = await async_wait_for_run_result(
+            self._transport,
+            published["stream_id"],
+            published["event_id"],
+            timeout=timeout,
+            on_chunk=on_chunk,
+        )
+        return _extract_run_result(run.get("result"))
 
     async def list(self, **query: Any) -> dict[str, Any]:
         return await self._transport.request_json("GET", "/events", params=query)
@@ -486,6 +671,40 @@ class AsyncEventsResource:
 
     async def get_runs(self, event_id: str) -> dict[str, Any]:
         return await self._transport.request_json("GET", f"/events/{enc(event_id)}/runs")
+
+
+class AsyncRunsResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def list(self, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/runs", params=query)
+
+    async def stats(self) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", "/runs/stats"))["data"]
+
+    async def get(self, run_id: str) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", f"/runs/{enc(run_id)}"))["data"]
+
+
+class AsyncEnvResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def get(self) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", "/env"))["data"]
+
+    async def subscribe(self) -> AsyncIterator[StreamEvent]:
+        async for event in aiter_stream(self._transport, "GET", "/env/subscribe"):
+            yield event
+
+
+class AsyncOrgResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def usage(self) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", "/org/usage"))["data"]
 
 
 class AsyncStreamsResource:
@@ -505,6 +724,36 @@ class AsyncStreamsResource:
             params={"project": project},
         ):
             yield event
+
+    async def subscribe_post(
+        self,
+        stream_id: str,
+        *,
+        project: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        async for event in aiter_stream(
+            self._transport,
+            "POST",
+            f"/streams/{enc(stream_id)}/subscribe",
+            params={"project": project},
+        ):
+            yield event
+
+    async def wait_for_run_result(
+        self,
+        stream_id: str,
+        event_id: str,
+        *,
+        timeout: float = 60.0,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        return await async_wait_for_run_result(
+            self._transport,
+            stream_id,
+            event_id,
+            timeout=timeout,
+            on_chunk=on_chunk,
+        )
 
     async def subscribe_with_event(
         self,
@@ -583,6 +832,294 @@ class AsyncStreamsResource:
             params={"project": project},
         ):
             yield event
+
+
+class AsyncFilesResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def list(self, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/files", params=query)
+
+    async def get(self, file_id: str) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", f"/files/{enc(file_id)}"))["data"]
+
+    async def delete(self, file_id: str) -> None:
+        await self._transport.request_raw("DELETE", f"/files/{enc(file_id)}")
+
+    async def download(self, file_id: str):
+        return await self._transport.request_raw("GET", f"/files/{enc(file_id)}/download")
+
+    async def upload(
+        self,
+        path: str,
+        content: bytes | str,
+        *,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        response = await self._transport.request_raw(
+            "PUT",
+            f"/files/upload/{enc_path(path)}",
+            content=content,
+            headers={
+                "Accept": "application/json",
+                **({"Content-Type": content_type} if content_type else {}),
+            },
+        )
+        return response.json()["data"]
+
+    async def initiate_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (await self._transport.request_json("POST", "/files/uploads", json=dict(body)))[
+            "data"
+        ]
+
+    async def upload_part(
+        self,
+        upload_id: str,
+        part_number: int,
+        content: bytes | str,
+    ) -> dict[str, Any]:
+        response = await self._transport.request_raw(
+            "PUT",
+            f"/files/uploads/{enc(upload_id)}/{part_number}",
+            content=content,
+            headers={"Accept": "application/json"},
+        )
+        return response.json()["data"]
+
+    async def complete_upload(self, upload_id: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "POST",
+                f"/files/uploads/{enc(upload_id)}/complete",
+            )
+        )["data"]
+
+    async def abort_upload(self, upload_id: str) -> None:
+        await self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
+
+
+class AsyncProjectsResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def list(self, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/projects", params=query)
+
+    async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (await self._transport.request_json("POST", "/projects", json=dict(body)))["data"]
+
+    async def get(self, project: str) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", f"/projects/{enc(project)}"))["data"]
+
+    async def update(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "PATCH",
+                f"/projects/{enc(project)}",
+                json=dict(body),
+            )
+        )["data"]
+
+    async def delete(self, project: str) -> None:
+        await self._transport.request_raw("DELETE", f"/projects/{enc(project)}")
+
+    async def activate(self, project: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json("POST", f"/projects/{enc(project)}/activate")
+        )["data"]
+
+    async def deactivate(self, project: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate")
+        )["data"]
+
+    async def event_handlers(self, project: str) -> dict[str, Any]:
+        return await self._transport.request_json(
+            "GET",
+            f"/projects/{enc(project)}/event-handlers",
+        )
+
+    async def schedules(self, project: str) -> dict[str, Any]:
+        return await self._transport.request_json(
+            "GET",
+            f"/projects/{enc(project)}/schedules",
+        )
+
+
+class AsyncBuildsResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def list(self, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/builds", params=query)
+
+    async def list_for_project(self, project: str, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json(
+            "GET",
+            f"/projects/{enc(project)}/builds",
+            params=query,
+        )
+
+    async def get(self, project: str, build_id: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "GET",
+                f"/projects/{enc(project)}/builds/{enc(build_id)}",
+            )
+        )["data"]
+
+    async def deployed(self, project: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "GET",
+                f"/projects/{enc(project)}/builds/deployed",
+            )
+        )["data"]
+
+    async def live(self, project: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live")
+        )["data"]
+
+    async def upload(
+        self,
+        project: str,
+        *,
+        file: Any,
+        hash: str,
+        build_id: str | None = None,
+    ) -> dict[str, Any]:
+        data = {"hash": hash, **({"build_id": build_id} if build_id else {})}
+        response = await self._transport.request_raw(
+            "POST",
+            f"/projects/{enc(project)}/builds",
+            data=data,
+            files={"file": file},
+            headers={"Accept": "application/json"},
+        )
+        return response.json()["data"]
+
+    async def download(self, project: str, build_id: str):
+        return await self._transport.request_raw(
+            "GET",
+            f"/projects/{enc(project)}/builds/{enc(build_id)}/download",
+        )
+
+    async def deploy(self, project: str, build_id: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "POST",
+                f"/projects/{enc(project)}/builds/{enc(build_id)}/deploy",
+            )
+        )["data"]
+
+
+class AsyncContextResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def list(self, project: str) -> dict[str, Any]:
+        return await self._transport.request_json("GET", f"/projects/{enc(project)}/context")
+
+    async def create(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "POST",
+                f"/projects/{enc(project)}/context",
+                json=dict(body),
+            )
+        )["data"]
+
+    async def update(self, project: str, key: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "PUT",
+                f"/projects/{enc(project)}/context/{enc(key)}",
+                json=dict(body),
+            )
+        )["data"]
+
+    async def delete(self, project: str, key: str) -> None:
+        await self._transport.request_raw(
+            "DELETE",
+            f"/projects/{enc(project)}/context/{enc(key)}",
+        )
+
+
+class AsyncDomainsResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (await self._transport.request_json("POST", "/domains", json=dict(body)))["data"]
+
+    async def list(self) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/domains")
+
+    async def get(self, domain_id: str) -> dict[str, Any]:
+        return (await self._transport.request_json("GET", f"/domains/{enc(domain_id)}"))["data"]
+
+    async def delete(self, domain_id: str) -> None:
+        await self._transport.request_raw("DELETE", f"/domains/{enc(domain_id)}")
+
+    async def verify(self, domain_id: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify")
+        )["data"]
+
+
+class AsyncSessionsResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (await self._transport.request_json("POST", "/sessions", json=dict(body)))["data"]
+
+    async def list(self, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/sessions", params=query)
+
+    async def revoke(self, session_id: str) -> None:
+        await self._transport.request_raw("DELETE", f"/sessions/{enc(session_id)}")
+
+    async def revoke_all(self) -> dict[str, Any]:
+        return (await self._transport.request_json("DELETE", "/sessions"))["data"]
+
+
+class AsyncServiceKeysResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (
+            await self._transport.request_json("POST", "/service-keys", json=dict(body))
+        )["data"]
+
+    async def list(self, **query: Any) -> dict[str, Any]:
+        return await self._transport.request_json("GET", "/service-keys", params=query)
+
+    async def get(self, service_key_id: str) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "GET",
+                f"/service-keys/{enc(service_key_id)}",
+            )
+        )["data"]
+
+    async def update(self, service_key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        return (
+            await self._transport.request_json(
+                "PATCH",
+                f"/service-keys/{enc(service_key_id)}",
+                json=dict(body),
+            )
+        )["data"]
+
+    async def revoke(self, service_key_id: str) -> None:
+        await self._transport.request_raw("DELETE", f"/service-keys/{enc(service_key_id)}")
+
+    async def revoke_all(self) -> dict[str, Any]:
+        return (await self._transport.request_json("DELETE", "/service-keys"))["data"]
 
 
 async def aiter_stream(

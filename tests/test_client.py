@@ -5,12 +5,17 @@ import json
 import httpx
 import pytest
 
-from hot import HotApiError, HotClient
+from hot import AsyncHotClient, HotApiError, HotClient
 
 
 def make_client(handler):
     client = httpx.Client(transport=httpx.MockTransport(handler))
     return HotClient(token="test-token", base_url="https://api.example.test", client=client)
+
+
+def make_async_client(handler):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return AsyncHotClient(token="test-token", base_url="https://api.example.test", client=client)
 
 
 def envelope(data):
@@ -101,8 +106,10 @@ def test_api_error_is_structured():
                     "code": "unauthorized",
                     "message": "Bad token",
                     "request_id": "req_123",
+                    "retry_after": 5,
                 }
             },
+            headers={"Retry-After": "5"},
         )
 
     with make_client(handler) as hot:
@@ -112,3 +119,50 @@ def test_api_error_is_structured():
     assert exc.value.status_code == 401
     assert exc.value.code == "unauthorized"
     assert exc.value.request_id == "req_123"
+    assert exc.value.retry_after == 5
+
+def test_call_hot_uses_nested_run_failure_result():
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json=envelope(
+                    {
+                        "event_id": "evt_123",
+                        "stream_id": "str_123",
+                    }
+                ),
+            ),
+            httpx.Response(
+                200,
+                content=(
+                    'data: {"type":"run:start","run":{"run_id":"run_123",'
+                    '"event_id":"evt_123"}}\n\n'
+                    'data: {"type":"run:fail","run":{"run_id":"run_123",'
+                    '"event_id":"evt_123","status":"failed",'
+                    '"result":{"$err":{"message":"boom"}}}}\n\n'
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    with make_client(handler) as hot:
+        with pytest.raises(RuntimeError, match="boom"):
+            hot.events.call_hot("demo/fn")
+
+
+def test_async_client_exposes_core_resources():
+    async def run():
+        async with make_async_client(lambda request: httpx.Response(200, json=envelope({}))) as hot:
+            assert hot.projects is not None
+            assert hot.files is not None
+            assert hot.env is not None
+            assert hot.streams is not None
+
+    import asyncio
+
+    asyncio.run(run())

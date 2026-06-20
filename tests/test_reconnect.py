@@ -187,3 +187,22 @@ def test_async_subscribe_with_event_reconnects():
         ("POST", "/v1/streams/subscribe-with-event"),
         ("GET", "/v1/streams/s1/subscribe"),
     ]
+
+
+def test_async_subscribe_post_uses_post_stream_endpoint():
+    handler, calls = make_handler(
+        [
+            _sse('data: {"type":"stream:complete","stream_id":"s1"}'),
+        ]
+    )
+
+    async def run():
+        async with make_async_client(handler) as hot:
+            events = []
+            async for event in hot.streams.subscribe_post("s1"):
+                events.append(event)
+            return events
+
+    events = asyncio.run(run())
+    assert events == [{"type": "stream:complete", "stream_id": "s1"}]
+    assert calls == [("POST", "/v1/streams/s1/subscribe")]

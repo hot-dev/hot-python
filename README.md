@@ -59,6 +59,8 @@ with HotClient(token=os.environ["HOT_API_KEY"]) as hot:
 
 Authenticated clients should run server-side. Browser apps and public notebooks
 should call your own backend route instead of exposing a Hot API key.
+Most management endpoints require an API key. Sessions and service keys are
+permission-scoped and are mainly for event publishing and stream reads.
 
 ## Async Usage
 
@@ -90,6 +92,8 @@ async with AsyncHotClient(token=os.environ["HOT_API_KEY"]) as hot:
         print(event["type"], event)
 ```
 
+`AsyncHotClient` exposes the same resource namespaces as `HotClient`.
+
 ## Errors
 
 Non-2xx API responses raise `HotApiError` with structured fields:
@@ -100,15 +104,15 @@ from hot import HotApiError
 try:
     hot.projects.get("missing-project")
 except HotApiError as error:
-    print(error.status_code, error.code, error.request_id)
+    print(error.status_code, error.code, error.request_id, error.retry_after)
 ```
 
 ## Resources
 
 `HotClient` mirrors the Hot API v1 resources:
 
-- `hot.events` — publish, list, get, and inspect event runs
-- `hot.streams` — subscribe to run streams and publish events atomically (reconnects automatically across the 5-minute SSE timeout; pass `reconnect=False` to opt out)
+- `hot.events` — publish, list, get, inspect event runs, and call Hot functions with `call_hot(fn, args)`
+- `hot.streams` — subscribe to run streams, wait for run results, and publish events atomically (reconnects automatically across the 5-minute SSE timeout; pass `reconnect=False` to opt out)
 - `hot.runs` — list, inspect, and view run stats
 - `hot.files` — upload, download, list, and delete files (including multipart uploads)
 - `hot.projects` — create, list, update, activate, deactivate, and delete projects
@@ -122,6 +126,12 @@ except HotApiError as error:
 
 Use `hot.request(...)` or `hot.request_raw(...)` as an escape hatch for API
 endpoints that do not yet have a resource helper.
+
+`hot.env.subscribe()` requires API key credentials and a live API pub/sub
+backend; local API servers without pub/sub return a 503. `subscribe_with_event`
+reconnects across the API's 5-minute SSE timeout and stops after the first
+terminal `run:*` event it sees, so keep using the stream directly if your app
+expects multiple independent runs on the same stream.
 
 ## Customizing the HTTP Client
 

@@ -7,7 +7,17 @@ import httpx
 
 from ._transport import AsyncTransport, SyncTransport
 from .resources import (
+    AsyncBuildsResource,
+    AsyncContextResource,
+    AsyncDomainsResource,
+    AsyncEnvResource,
     AsyncEventsResource,
+    AsyncFilesResource,
+    AsyncOrgResource,
+    AsyncProjectsResource,
+    AsyncRunsResource,
+    AsyncServiceKeysResource,
+    AsyncSessionsResource,
     AsyncStreamsResource,
     BuildsResource,
     ContextResource,
@@ -93,11 +103,7 @@ class HotClient:
 
 
 class AsyncHotClient:
-    """Asynchronous Hot API client.
-
-    Async support currently focuses on event publishing and stream consumption,
-    where async is most valuable.
-    """
+    """Asynchronous Hot API client."""
 
     def __init__(
         self,
@@ -113,7 +119,17 @@ class AsyncHotClient:
             timeout=timeout,
             client=client,
         )
+        self.builds = AsyncBuildsResource(self._transport)
+        self.context = AsyncContextResource(self._transport)
+        self.domains = AsyncDomainsResource(self._transport)
+        self.env = AsyncEnvResource(self._transport)
         self.events = AsyncEventsResource(self._transport)
+        self.files = AsyncFilesResource(self._transport)
+        self.org = AsyncOrgResource(self._transport)
+        self.projects = AsyncProjectsResource(self._transport)
+        self.runs = AsyncRunsResource(self._transport)
+        self.service_keys = AsyncServiceKeysResource(self._transport)
+        self.sessions = AsyncSessionsResource(self._transport)
         self.streams = AsyncStreamsResource(self._transport)
 
     @property
