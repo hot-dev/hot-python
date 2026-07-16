@@ -28,7 +28,15 @@ done
 [ -n "$up" ] || { echo "error: hot dev did not become ready" >&2; tail -20 fixture/dev.out >&2; exit 1; }
 
 export HOT_TEST_BASE_URL="http://127.0.0.1:$PORT"
-HOT_TEST_API_KEY="$(python3 mint_key.py fixture/.hot/db/hot.sqlite.db)"
+# `hot key create` ships in hot > 2.6.1; fall back to minting directly in
+# sqlite (mint_key.py) for older CLIs. Drop the fallback once the hot
+# release containing `hot key create` is the oldest supported version.
+if HOT_TEST_API_KEY="$(cd fixture && hot key create --description sdk-integration 2>/dev/null)" && [ -n "$HOT_TEST_API_KEY" ]; then
+  echo "minted key via hot key create"
+else
+  HOT_TEST_API_KEY="$(python3 mint_key.py fixture/.hot/db/hot.sqlite.db)"
+  echo "minted key via mint_key.py (hot CLI without \`hot key create\`)"
+fi
 export HOT_TEST_API_KEY
 
 echo "hot dev ready; running integration tests..."
