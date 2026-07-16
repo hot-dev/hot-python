@@ -59,7 +59,7 @@ jobs:
           .venv/bin/python -m pip install -e ".[dev]"
 
       - name: Install hot
-        uses: hotdev/setup-hot@v1
+        uses: hot-dev/setup-hot@v1
 
       - name: Run integration tests
         run: ./integration/run.sh
