@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 from urllib.parse import quote
 
+import httpx
+
 from ._transport import AsyncTransport, SyncTransport, raise_for_status, without_none
 from .sse import consume_sse_blocks
 from .types import StreamEvent
@@ -42,7 +44,7 @@ def _result_message(value: Any) -> str | None:
         return value
     if not isinstance(value, dict):
         return None
-    for key in ("$err", "error", "message", "reason"):
+    for key in ("$err", "$val", "error", "message", "msg", "reason", "err"):
         message = _result_message(value.get(key))
         if message:
             return message
@@ -533,7 +535,9 @@ def iter_stream(
     *,
     json: Mapping[str, Any] | None = None,
     params: Mapping[str, Any] | None = None,
+    timeout: httpx.Timeout | None = None,
 ) -> Iterator[StreamEvent]:
+    extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     with transport.client.stream(
         method,
         f"{transport.api_base_url}{path}",
@@ -545,7 +549,10 @@ def iter_stream(
         ),
         json=dict(json) if json is not None else None,
         params=without_none(params),
+        **extra,
     ) as response:
+        if response.is_error:
+            response.read()
         raise_for_status(response)
         buffer = ""
         for chunk in response.iter_text():
@@ -567,28 +574,38 @@ def wait_for_run_result(
     deadline = time.monotonic() + timeout
     current_run_id: str | None = None
 
-    for event in iter_stream(transport, "GET", f"/streams/{enc(stream_id)}/subscribe"):
-        if time.monotonic() > deadline:
-            raise TimeoutError("Timeout waiting for run result")
+    # The read timeout aborts a silent stream; the per-event deadline check
+    # below bounds streams that keep trickling events past the deadline.
+    try:
+        for event in iter_stream(
+            transport,
+            "GET",
+            f"/streams/{enc(stream_id)}/subscribe",
+            timeout=httpx.Timeout(None, read=timeout),
+        ):
+            if time.monotonic() > deadline:
+                raise TimeoutError("Timeout waiting for run result")
 
-        if event.get("type") == "run:start":
-            run = event.get("run")
-            if _event_id_of_run(run) == event_id:
-                current_run_id = _run_id_of(event)
+            if event.get("type") == "run:start":
+                run = event.get("run")
+                if _event_id_of_run(run) == event_id:
+                    current_run_id = _run_id_of(event)
 
-        if current_run_id and event.get("type") == "stream:data":
-            if event.get("run_id") == current_run_id:
-                _emit_chunk(event, on_chunk)
+            if current_run_id and event.get("type") == "stream:data":
+                if event.get("run_id") == current_run_id:
+                    _emit_chunk(event, on_chunk)
 
-        if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
-            run = event.get("run")
-            if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
-                continue
-            if event.get("type") == "run:fail":
-                raise RuntimeError(_run_result_message(run, "Run failed"))
-            if event.get("type") == "run:cancel":
-                raise RuntimeError(_run_result_message(run, "Run cancelled"))
-            return run
+            if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
+                run = event.get("run")
+                if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
+                    continue
+                if event.get("type") == "run:fail":
+                    raise RuntimeError(_run_result_message(run, "Run failed"))
+                if event.get("type") == "run:cancel":
+                    raise RuntimeError(_run_result_message(run, "Run cancelled"))
+                return run
+    except httpx.TimeoutException as error:
+        raise TimeoutError("Timeout waiting for run result") from error
 
     raise RuntimeError("Stream ended before run completed")
 
@@ -604,28 +621,38 @@ async def async_wait_for_run_result(
     deadline = time.monotonic() + timeout
     current_run_id: str | None = None
 
-    async for event in aiter_stream(transport, "GET", f"/streams/{enc(stream_id)}/subscribe"):
-        if time.monotonic() > deadline:
-            raise TimeoutError("Timeout waiting for run result")
+    # The read timeout aborts a silent stream; the per-event deadline check
+    # below bounds streams that keep trickling events past the deadline.
+    try:
+        async for event in aiter_stream(
+            transport,
+            "GET",
+            f"/streams/{enc(stream_id)}/subscribe",
+            timeout=httpx.Timeout(None, read=timeout),
+        ):
+            if time.monotonic() > deadline:
+                raise TimeoutError("Timeout waiting for run result")
 
-        if event.get("type") == "run:start":
-            run = event.get("run")
-            if _event_id_of_run(run) == event_id:
-                current_run_id = _run_id_of(event)
+            if event.get("type") == "run:start":
+                run = event.get("run")
+                if _event_id_of_run(run) == event_id:
+                    current_run_id = _run_id_of(event)
 
-        if current_run_id and event.get("type") == "stream:data":
-            if event.get("run_id") == current_run_id:
-                _emit_chunk(event, on_chunk)
+            if current_run_id and event.get("type") == "stream:data":
+                if event.get("run_id") == current_run_id:
+                    _emit_chunk(event, on_chunk)
 
-        if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
-            run = event.get("run")
-            if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
-                continue
-            if event.get("type") == "run:fail":
-                raise RuntimeError(_run_result_message(run, "Run failed"))
-            if event.get("type") == "run:cancel":
-                raise RuntimeError(_run_result_message(run, "Run cancelled"))
-            return run
+            if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
+                run = event.get("run")
+                if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
+                    continue
+                if event.get("type") == "run:fail":
+                    raise RuntimeError(_run_result_message(run, "Run failed"))
+                if event.get("type") == "run:cancel":
+                    raise RuntimeError(_run_result_message(run, "Run cancelled"))
+                return run
+    except httpx.TimeoutException as error:
+        raise TimeoutError("Timeout waiting for run result") from error
 
     raise RuntimeError("Stream ended before run completed")
 
@@ -1129,7 +1156,9 @@ async def aiter_stream(
     *,
     json: Mapping[str, Any] | None = None,
     params: Mapping[str, Any] | None = None,
+    timeout: httpx.Timeout | None = None,
 ) -> AsyncIterator[StreamEvent]:
+    extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     async with transport.client.stream(
         method,
         f"{transport.api_base_url}{path}",
@@ -1141,7 +1170,10 @@ async def aiter_stream(
         ),
         json=dict(json) if json is not None else None,
         params=without_none(params),
+        **extra,
     ) as response:
+        if response.is_error:
+            await response.aread()
         raise_for_status(response)
         buffer = ""
         async for chunk in response.aiter_text():

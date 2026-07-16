@@ -1,0 +1,38 @@
+// Deterministic handlers and functions exercised by the SDK integration tests.
+// Every SDK's integration suite drives the same three flows:
+//   - publish "sdk:echo" and read the run result back over SSE
+//   - hot:call ::fixture::sdk/add-nums for the call/wait helper
+//   - publish "sdk:fail" to observe the run:fail error path
+::fixture::sdk ns
+
+// Echoes the event payload back as the run result.
+on-sdk-echo
+meta {on-event: "sdk:echo"}
+fn (event) {
+  {echoed: event.data}
+}
+
+// Always fails, with a stable message the tests assert on.
+on-sdk-fail
+meta {on-event: "sdk:fail"}
+fn (event) {
+  fail("sdk fixture failure")
+}
+
+// Called via the hot:call event by the call-hot/wait helpers.
+add-nums
+fn (a: Int, b: Int): Int {
+  add(a, b)
+}
+
+// String round-trip for a second hot:call shape.
+shout
+fn (text: Str): Str {
+  uppercase(text)
+}
+
+// Callable function that always fails, for hot:call error-path tests.
+always-fail
+fn (): Str {
+  fail("sdk fixture failure")
+}

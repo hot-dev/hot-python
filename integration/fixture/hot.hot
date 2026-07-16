@@ -1,0 +1,22 @@
+// Hot configuration for the SDK integration-test fixture project.
+::hot::conf ns
+
+::env ::hot::env
+
+hot.set.project "sdk-fixture"
+
+// The integration-test runner picks free ports via these env vars.
+hot.api.port Int(::env/get("HOT_API_PORT", "4681"))
+hot.app.port Int(::env/get("HOT_APP_PORT", "4680"))
+
+// Bind the IPv4 loopback explicitly: "localhost" can resolve to ::1 only,
+// which clients that dial 127.0.0.1 (e.g. the JDK) cannot reach.
+hot.api.host Str(::env/get("HOT_API_HOST", "127.0.0.1"))
+hot.app.host Str(::env/get("HOT_APP_HOST", "127.0.0.1"))
+
+hot.project.sdk-fixture.src.paths ["./hot/src"]
+hot.project.sdk-fixture.test.paths ["./hot/test"]
+hot.project.sdk-fixture.resources.paths ["./hot/resources"]
+hot.project.sdk-fixture.deps {}
+
+hot.dev.open false

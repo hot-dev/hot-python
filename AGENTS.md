@@ -41,3 +41,33 @@ git push origin main v<version>
 
 Always update the SDK version in lockstep with new API surface area added to
 the matching `@hot-dev/sdk` JavaScript release when possible.
+
+## Integration Tests
+
+`integration/run.sh` starts a scratch `hot dev` (requires the `hot` CLI and
+python3 on PATH) serving the Hot fixture project in `integration/fixture`
+(project `sdk-fixture`: an echo event handler, an always-failing handler and
+function, and hot:call targets). It binds 127.0.0.1 on HOT_TEST_PORT (default
+4725), mints a full-access API key directly in the fixture's sqlite database,
+exports HOT_TEST_BASE_URL / HOT_TEST_API_KEY, and runs `pytest tests/test_integration.py`.
+The integration tests skip when HOT_TEST_API_KEY is unset, so regular test
+runs are unaffected. The fixture pins the API to 127.0.0.1 because binding
+"localhost" can yield an IPv6-only listener that JDK-style clients (which
+dial the first resolved address only) cannot reach.
+
+## Lockstep Releases
+
+All five SDK repos (hot-js, hot-python, hot-go, hot-rust, hot-java) release in
+lockstep. Checklist for a coordinated release:
+
+1. Bump every SDK's version: js `npm version` (syncs src/version.ts via the
+   `version` script), python pyproject.toml, rust Cargo.toml, java
+   gradle.properties + README snippets, go `Version` constant in client.go.
+2. Regenerate each repo's openapi-operations fixture from a current `hot dev`
+   and reconcile the coverage tables.
+3. Run every repo's `integration/run.sh`.
+4. Commit, tag `v<version>`, push in each repo.
+
+The integration fixture (integration/fixture, mint_key.py, run.sh) is
+duplicated across all five repos; the canonical copy lives in **hot-python** —
+change it there first, then sync the others.

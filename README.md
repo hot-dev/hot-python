@@ -107,6 +107,12 @@ except HotApiError as error:
     print(error.status_code, error.code, error.request_id, error.retry_after)
 ```
 
+### Retries
+
+JSON requests are retried automatically (at most twice) when the API responds
+429 with a `retry_after`; other errors are raised as-is. Streaming and raw
+requests are never retried.
+
 ## Resources
 
 `HotClient` mirrors the Hot API v1 resources:
@@ -187,6 +193,12 @@ python -m build
 - [Python SDK docs](https://hot.dev/docs/api/python)
 - [JavaScript / TypeScript SDK](https://www.npmjs.com/package/@hot-dev/sdk)
 - [Hot Chat demo](https://github.com/hot-dev/hot-demos/tree/main/hot-chat)
+
+## Layer 2 Helpers
+
+This SDK intentionally covers the core Hot API (Layer 1). Agent, webhook, and
+proxy helpers (Layer 2) currently live in the JavaScript SDK's subpath exports
+(`@hot-dev/sdk/agent`, `/webhook`, `/proxy`).
 
 ## License
 

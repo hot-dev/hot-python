@@ -37,6 +37,7 @@ def test_publish_event_sends_bearer_token_and_returns_data():
         seen["method"] = request.method
         seen["path"] = request.url.path
         seen["auth"] = request.headers["authorization"]
+        seen["user_agent"] = request.headers["user-agent"]
         seen["body"] = json.loads(request.content)
         return httpx.Response(200, json=envelope({"event_id": "evt_123", "stream_id": "str_123"}))
 
@@ -49,6 +50,7 @@ def test_publish_event_sends_bearer_token_and_returns_data():
         )
 
     assert event["event_id"] == "evt_123"
+    assert seen.pop("user_agent").startswith("hot-sdk-python/")
     assert seen == {
         "method": "POST",
         "path": "/v1/events",
@@ -58,6 +60,59 @@ def test_publish_event_sends_bearer_token_and_returns_data():
             "event_data": {"question": "what changed?"},
         },
     }
+
+
+def test_retries_429_with_retry_after():
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(
+                429,
+                json={"error": {"code": "rate_limited", "message": "Slow down"}},
+                headers={"Retry-After": "1"},
+            )
+        return httpx.Response(200, json=envelope({"id": "run_123"}))
+
+    with make_client(handler) as hot:
+        run = hot.runs.get("run_123")
+
+    assert run["id"] == "run_123"
+    assert calls["count"] == 2
+
+
+def test_stream_error_responses_raise_structured_api_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={"error": {"code": "not_found", "message": "No such stream"}},
+        )
+
+    with make_client(handler) as hot:
+        with pytest.raises(HotApiError) as exc:
+            list(hot.streams.subscribe("missing-stream"))
+
+    assert exc.value.status_code == 404
+    assert exc.value.code == "not_found"
+
+
+def test_429_without_retry_after_is_not_retried():
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(
+            429,
+            json={"error": {"code": "rate_limited", "message": "Slow down"}},
+        )
+
+    with make_client(handler) as hot:
+        with pytest.raises(HotApiError) as exc:
+            hot.runs.get("run_123")
+
+    assert exc.value.status_code == 429
+    assert calls["count"] == 1
 
 
 def test_list_methods_return_api_list_envelope():
@@ -152,6 +207,42 @@ def test_call_hot_uses_nested_run_failure_result():
 
     with make_client(handler) as hot:
         with pytest.raises(RuntimeError, match="boom"):
+            hot.events.call_hot("demo/fn")
+
+
+def test_call_hot_surfaces_hot_run_failure_shape():
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json=envelope(
+                    {
+                        "event_id": "evt_123",
+                        "stream_id": "str_123",
+                    }
+                ),
+            ),
+            httpx.Response(
+                200,
+                content=(
+                    'data: {"type":"run:start","run":{"run_id":"run_123",'
+                    '"event_id":"evt_123"}}\n\n'
+                    'data: {"type":"run:fail","run":{"run_id":"run_123",'
+                    '"event_id":"evt_123","status":"failed",'
+                    '"result":{"$type":"::hot::run/Failure",'
+                    '"$origin":{"function":"::hot::exec/fail"},'
+                    '"$val":{"msg":"too hot","err":"too hot"}}}}\n\n'
+                ),
+                headers={"content-type": "text/event-stream"},
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    with make_client(handler) as hot:
+        with pytest.raises(RuntimeError, match="too hot"):
             hot.events.call_hot("demo/fn")
 
 
