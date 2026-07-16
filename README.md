@@ -190,7 +190,7 @@ python -m build
 ## Related
 
 - [Hot Dev documentation](https://hot.dev/docs)
-- [Python SDK docs](https://hot.dev/docs/api/python)
+- [SDK docs](https://hot.dev/docs/api/sdks)
 - [JavaScript / TypeScript SDK](https://www.npmjs.com/package/@hot-dev/sdk)
 - [Hot Chat demo](https://github.com/hot-dev/hot-demos/tree/main/hot-chat)
 

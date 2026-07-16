@@ -14,10 +14,12 @@ from .types import StreamEvent
 
 
 def enc(value: str) -> str:
+    """Percent-encode a single path segment, including any slash."""
     return quote(value, safe="")
 
 
 def enc_path(path: str) -> str:
+    """Percent-encode each segment of a slash-separated path."""
     return "/".join(quote(part, safe="") for part in path.split("/"))
 
 
@@ -80,6 +82,7 @@ class EventsResource:
         self._transport = transport
 
     def publish(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Publish an event and return the created event data."""
         return self._transport.request_json("POST", "/events", json=dict(body))["data"]
 
     def call_hot(
@@ -90,6 +93,7 @@ class EventsResource:
         timeout: float = 60.0,
         on_chunk: Callable[[str], None] | None = None,
     ) -> Any:
+        """Call a Hot function and wait for its result, unwrapping ``{"$ok": ...}``."""
         published = self.publish(
             {
                 "event_type": "hot:call",
@@ -109,12 +113,15 @@ class EventsResource:
         return _extract_run_result(run.get("result"))
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the event list envelope (data + pagination)."""
         return self._transport.request_json("GET", "/events", params=query)
 
     def get(self, event_id: str) -> dict[str, Any]:
+        """Return a single event."""
         return self._transport.request_json("GET", f"/events/{enc(event_id)}")["data"]
 
     def get_runs(self, event_id: str) -> dict[str, Any]:
+        """Return the runs triggered by an event."""
         return self._transport.request_json("GET", f"/events/{enc(event_id)}/runs")
 
 
@@ -123,12 +130,15 @@ class RunsResource:
         self._transport = transport
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the run list envelope (data + pagination)."""
         return self._transport.request_json("GET", "/runs", params=query)
 
     def stats(self) -> dict[str, Any]:
+        """Return aggregate run statistics."""
         return self._transport.request_json("GET", "/runs/stats")["data"]
 
     def get(self, run_id: str) -> dict[str, Any]:
+        """Return a single run."""
         return self._transport.request_json("GET", f"/runs/{enc(run_id)}")["data"]
 
 
@@ -137,9 +147,11 @@ class EnvResource:
         self._transport = transport
 
     def get(self) -> dict[str, Any]:
+        """Return environment info."""
         return self._transport.request_json("GET", "/env")["data"]
 
     def subscribe(self) -> Iterator[StreamEvent]:
+        """Stream environment events (requires API key credentials and pub/sub)."""
         yield from iter_stream(self._transport, "GET", "/env/subscribe")
 
 
@@ -148,6 +160,7 @@ class OrgResource:
         self._transport = transport
 
     def usage(self) -> dict[str, Any]:
+        """Return organization usage and limits."""
         return self._transport.request_json("GET", "/org/usage")["data"]
 
 
@@ -156,6 +169,7 @@ class StreamsResource:
         self._transport = transport
 
     def subscribe(self, stream_id: str, *, project: str | None = None) -> Iterator[StreamEvent]:
+        """Stream events from an existing run stream."""
         yield from iter_stream(
             self._transport,
             "GET",
@@ -169,6 +183,7 @@ class StreamsResource:
         *,
         project: str | None = None,
     ) -> Iterator[StreamEvent]:
+        """Stream events from an existing run stream via POST."""
         yield from iter_stream(
             self._transport,
             "POST",
@@ -184,6 +199,7 @@ class StreamsResource:
         timeout: float = 60.0,
         on_chunk: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
+        """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
         return wait_for_run_result(
             self._transport,
             stream_id,
@@ -285,15 +301,19 @@ class FilesResource:
         self._transport = transport
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the file list envelope (data + pagination)."""
         return self._transport.request_json("GET", "/files", params=query)
 
     def get(self, file_id: str) -> dict[str, Any]:
+        """Return a single file's metadata."""
         return self._transport.request_json("GET", f"/files/{enc(file_id)}")["data"]
 
     def delete(self, file_id: str) -> None:
+        """Delete a file."""
         self._transport.request_raw("DELETE", f"/files/{enc(file_id)}")
 
     def download(self, file_id: str):
+        """Return the raw HTTP response streaming the file content."""
         return self._transport.request_raw("GET", f"/files/{enc(file_id)}/download")
 
     def upload(
@@ -303,6 +323,7 @@ class FilesResource:
         *,
         content_type: str | None = None,
     ) -> dict[str, Any]:
+        """Upload content to a slash-separated file path."""
         response = self._transport.request_raw(
             "PUT",
             f"/files/upload/{enc_path(path)}",
@@ -315,9 +336,11 @@ class FilesResource:
         return response.json()["data"]
 
     def initiate_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Start a multipart upload."""
         return self._transport.request_json("POST", "/files/uploads", json=dict(body))["data"]
 
     def upload_part(self, upload_id: str, part_number: int, content: bytes | str) -> dict[str, Any]:
+        """Upload one part of a multipart upload."""
         response = self._transport.request_raw(
             "PUT",
             f"/files/uploads/{enc(upload_id)}/{part_number}",
@@ -327,12 +350,14 @@ class FilesResource:
         return response.json()["data"]
 
     def complete_upload(self, upload_id: str) -> dict[str, Any]:
+        """Finish a multipart upload."""
         return self._transport.request_json(
             "POST",
             f"/files/uploads/{enc(upload_id)}/complete",
         )["data"]
 
     def abort_upload(self, upload_id: str) -> None:
+        """Cancel a multipart upload."""
         self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
 
 
@@ -341,15 +366,19 @@ class ProjectsResource:
         self._transport = transport
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the project list envelope (data + pagination)."""
         return self._transport.request_json("GET", "/projects", params=query)
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a project."""
         return self._transport.request_json("POST", "/projects", json=dict(body))["data"]
 
     def get(self, project: str) -> dict[str, Any]:
+        """Return a project by id or slug."""
         return self._transport.request_json("GET", f"/projects/{enc(project)}")["data"]
 
     def update(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Patch a project."""
         return self._transport.request_json(
             "PATCH",
             f"/projects/{enc(project)}",
@@ -357,20 +386,25 @@ class ProjectsResource:
         )["data"]
 
     def delete(self, project: str) -> None:
+        """Delete a project."""
         self._transport.request_raw("DELETE", f"/projects/{enc(project)}")
 
     def activate(self, project: str) -> dict[str, Any]:
+        """Activate a project."""
         return self._transport.request_json("POST", f"/projects/{enc(project)}/activate")["data"]
 
     def deactivate(self, project: str) -> dict[str, Any]:
+        """Deactivate a project."""
         return self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate")[
             "data"
         ]
 
     def event_handlers(self, project: str) -> dict[str, Any]:
+        """Return the project's event handlers."""
         return self._transport.request_json("GET", f"/projects/{enc(project)}/event-handlers")
 
     def schedules(self, project: str) -> dict[str, Any]:
+        """Return the project's schedules."""
         return self._transport.request_json("GET", f"/projects/{enc(project)}/schedules")
 
 
@@ -379,9 +413,11 @@ class BuildsResource:
         self._transport = transport
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the build list envelope across all projects."""
         return self._transport.request_json("GET", "/builds", params=query)
 
     def list_for_project(self, project: str, **query: Any) -> dict[str, Any]:
+        """Return the build list envelope for one project."""
         return self._transport.request_json(
             "GET",
             f"/projects/{enc(project)}/builds",
@@ -389,18 +425,21 @@ class BuildsResource:
         )
 
     def get(self, project: str, build_id: str) -> dict[str, Any]:
+        """Return a single build."""
         return self._transport.request_json(
             "GET",
             f"/projects/{enc(project)}/builds/{enc(build_id)}",
         )["data"]
 
     def deployed(self, project: str) -> dict[str, Any]:
+        """Return the project's deployed build."""
         return self._transport.request_json(
             "GET",
             f"/projects/{enc(project)}/builds/deployed",
         )["data"]
 
     def live(self, project: str) -> dict[str, Any]:
+        """Return the project's live build."""
         return self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live")[
             "data"
         ]
@@ -413,6 +452,7 @@ class BuildsResource:
         hash: str,
         build_id: str | None = None,
     ) -> dict[str, Any]:
+        """Upload a build archive as multipart form data."""
         data = {"hash": hash, **({"build_id": build_id} if build_id else {})}
         response = self._transport.request_raw(
             "POST",
@@ -424,12 +464,14 @@ class BuildsResource:
         return response.json()["data"]
 
     def download(self, project: str, build_id: str):
+        """Return the raw HTTP response streaming the build archive."""
         return self._transport.request_raw(
             "GET",
             f"/projects/{enc(project)}/builds/{enc(build_id)}/download",
         )
 
     def deploy(self, project: str, build_id: str) -> dict[str, Any]:
+        """Deploy a build."""
         return self._transport.request_json(
             "POST",
             f"/projects/{enc(project)}/builds/{enc(build_id)}/deploy",
@@ -441,9 +483,11 @@ class ContextResource:
         self._transport = transport
 
     def list(self, project: str) -> dict[str, Any]:
+        """Return the context variable list envelope for a project."""
         return self._transport.request_json("GET", f"/projects/{enc(project)}/context")
 
     def create(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a context variable."""
         return self._transport.request_json(
             "POST",
             f"/projects/{enc(project)}/context",
@@ -451,6 +495,7 @@ class ContextResource:
         )["data"]
 
     def update(self, project: str, key: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace a context variable."""
         return self._transport.request_json(
             "PUT",
             f"/projects/{enc(project)}/context/{enc(key)}",
@@ -458,6 +503,7 @@ class ContextResource:
         )["data"]
 
     def delete(self, project: str, key: str) -> None:
+        """Delete a context variable."""
         self._transport.request_raw("DELETE", f"/projects/{enc(project)}/context/{enc(key)}")
 
 
@@ -466,18 +512,23 @@ class DomainsResource:
         self._transport = transport
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Register a custom domain."""
         return self._transport.request_json("POST", "/domains", json=dict(body))["data"]
 
     def list(self) -> dict[str, Any]:
+        """Return the domain list envelope."""
         return self._transport.request_json("GET", "/domains")
 
     def get(self, domain_id: str) -> dict[str, Any]:
+        """Return a single domain."""
         return self._transport.request_json("GET", f"/domains/{enc(domain_id)}")["data"]
 
     def delete(self, domain_id: str) -> None:
+        """Delete a domain."""
         self._transport.request_raw("DELETE", f"/domains/{enc(domain_id)}")
 
     def verify(self, domain_id: str) -> dict[str, Any]:
+        """Trigger domain verification."""
         return self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify")["data"]
 
 
@@ -486,15 +537,19 @@ class SessionsResource:
         self._transport = transport
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a scoped session."""
         return self._transport.request_json("POST", "/sessions", json=dict(body))["data"]
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the session list envelope."""
         return self._transport.request_json("GET", "/sessions", params=query)
 
     def revoke(self, session_id: str) -> None:
+        """Revoke one session."""
         self._transport.request_raw("DELETE", f"/sessions/{enc(session_id)}")
 
     def revoke_all(self) -> dict[str, Any]:
+        """Revoke every session."""
         return self._transport.request_json("DELETE", "/sessions")["data"]
 
 
@@ -503,18 +558,22 @@ class ServiceKeysResource:
         self._transport = transport
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a scoped service key."""
         return self._transport.request_json("POST", "/service-keys", json=dict(body))["data"]
 
     def list(self, **query: Any) -> dict[str, Any]:
+        """Return the service key list envelope."""
         return self._transport.request_json("GET", "/service-keys", params=query)
 
     def get(self, service_key_id: str) -> dict[str, Any]:
+        """Return a single service key."""
         return self._transport.request_json(
             "GET",
             f"/service-keys/{enc(service_key_id)}",
         )["data"]
 
     def update(self, service_key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Patch a service key."""
         return self._transport.request_json(
             "PATCH",
             f"/service-keys/{enc(service_key_id)}",
@@ -522,9 +581,11 @@ class ServiceKeysResource:
         )["data"]
 
     def revoke(self, service_key_id: str) -> None:
+        """Revoke one service key."""
         self._transport.request_raw("DELETE", f"/service-keys/{enc(service_key_id)}")
 
     def revoke_all(self) -> dict[str, Any]:
+        """Revoke every service key."""
         return self._transport.request_json("DELETE", "/service-keys")["data"]
 
 
@@ -537,6 +598,7 @@ def iter_stream(
     params: Mapping[str, Any] | None = None,
     timeout: httpx.Timeout | None = None,
 ) -> Iterator[StreamEvent]:
+    """Open an SSE request and yield decoded stream events."""
     extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     with transport.client.stream(
         method,
@@ -571,6 +633,7 @@ def wait_for_run_result(
     timeout: float = 60.0,
     on_chunk: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
     deadline = time.monotonic() + timeout
     current_run_id: str | None = None
 
@@ -618,6 +681,7 @@ async def async_wait_for_run_result(
     timeout: float = 60.0,
     on_chunk: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
     deadline = time.monotonic() + timeout
     current_run_id: str | None = None
 
@@ -662,6 +726,7 @@ class AsyncEventsResource:
         self._transport = transport
 
     async def publish(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Publish an event and return the created event data."""
         return (await self._transport.request_json("POST", "/events", json=dict(body)))["data"]
 
     async def call_hot(
@@ -672,6 +737,7 @@ class AsyncEventsResource:
         timeout: float = 60.0,
         on_chunk: Callable[[str], None] | None = None,
     ) -> Any:
+        """Call a Hot function and wait for its result, unwrapping ``{"$ok": ...}``."""
         published = await self.publish(
             {
                 "event_type": "hot:call",
@@ -691,12 +757,15 @@ class AsyncEventsResource:
         return _extract_run_result(run.get("result"))
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the event list envelope (data + pagination)."""
         return await self._transport.request_json("GET", "/events", params=query)
 
     async def get(self, event_id: str) -> dict[str, Any]:
+        """Return a single event."""
         return (await self._transport.request_json("GET", f"/events/{enc(event_id)}"))["data"]
 
     async def get_runs(self, event_id: str) -> dict[str, Any]:
+        """Return the runs triggered by an event."""
         return await self._transport.request_json("GET", f"/events/{enc(event_id)}/runs")
 
 
@@ -705,12 +774,15 @@ class AsyncRunsResource:
         self._transport = transport
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the run list envelope (data + pagination)."""
         return await self._transport.request_json("GET", "/runs", params=query)
 
     async def stats(self) -> dict[str, Any]:
+        """Return aggregate run statistics."""
         return (await self._transport.request_json("GET", "/runs/stats"))["data"]
 
     async def get(self, run_id: str) -> dict[str, Any]:
+        """Return a single run."""
         return (await self._transport.request_json("GET", f"/runs/{enc(run_id)}"))["data"]
 
 
@@ -719,9 +791,11 @@ class AsyncEnvResource:
         self._transport = transport
 
     async def get(self) -> dict[str, Any]:
+        """Return environment info."""
         return (await self._transport.request_json("GET", "/env"))["data"]
 
     async def subscribe(self) -> AsyncIterator[StreamEvent]:
+        """Stream environment events (requires API key credentials and pub/sub)."""
         async for event in aiter_stream(self._transport, "GET", "/env/subscribe"):
             yield event
 
@@ -731,6 +805,7 @@ class AsyncOrgResource:
         self._transport = transport
 
     async def usage(self) -> dict[str, Any]:
+        """Return organization usage and limits."""
         return (await self._transport.request_json("GET", "/org/usage"))["data"]
 
 
@@ -744,6 +819,7 @@ class AsyncStreamsResource:
         *,
         project: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        """Stream events from an existing run stream."""
         async for event in aiter_stream(
             self._transport,
             "GET",
@@ -758,6 +834,7 @@ class AsyncStreamsResource:
         *,
         project: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        """Stream events from an existing run stream via POST."""
         async for event in aiter_stream(
             self._transport,
             "POST",
@@ -774,6 +851,7 @@ class AsyncStreamsResource:
         timeout: float = 60.0,
         on_chunk: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
+        """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
         return await async_wait_for_run_result(
             self._transport,
             stream_id,
@@ -866,15 +944,19 @@ class AsyncFilesResource:
         self._transport = transport
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the file list envelope (data + pagination)."""
         return await self._transport.request_json("GET", "/files", params=query)
 
     async def get(self, file_id: str) -> dict[str, Any]:
+        """Return a single file's metadata."""
         return (await self._transport.request_json("GET", f"/files/{enc(file_id)}"))["data"]
 
     async def delete(self, file_id: str) -> None:
+        """Delete a file."""
         await self._transport.request_raw("DELETE", f"/files/{enc(file_id)}")
 
     async def download(self, file_id: str):
+        """Return the raw HTTP response streaming the file content."""
         return await self._transport.request_raw("GET", f"/files/{enc(file_id)}/download")
 
     async def upload(
@@ -884,6 +966,7 @@ class AsyncFilesResource:
         *,
         content_type: str | None = None,
     ) -> dict[str, Any]:
+        """Upload content to a slash-separated file path."""
         response = await self._transport.request_raw(
             "PUT",
             f"/files/upload/{enc_path(path)}",
@@ -896,6 +979,7 @@ class AsyncFilesResource:
         return response.json()["data"]
 
     async def initiate_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Start a multipart upload."""
         return (await self._transport.request_json("POST", "/files/uploads", json=dict(body)))[
             "data"
         ]
@@ -906,6 +990,7 @@ class AsyncFilesResource:
         part_number: int,
         content: bytes | str,
     ) -> dict[str, Any]:
+        """Upload one part of a multipart upload."""
         response = await self._transport.request_raw(
             "PUT",
             f"/files/uploads/{enc(upload_id)}/{part_number}",
@@ -915,6 +1000,7 @@ class AsyncFilesResource:
         return response.json()["data"]
 
     async def complete_upload(self, upload_id: str) -> dict[str, Any]:
+        """Finish a multipart upload."""
         return (
             await self._transport.request_json(
                 "POST",
@@ -923,6 +1009,7 @@ class AsyncFilesResource:
         )["data"]
 
     async def abort_upload(self, upload_id: str) -> None:
+        """Cancel a multipart upload."""
         await self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
 
 
@@ -931,15 +1018,19 @@ class AsyncProjectsResource:
         self._transport = transport
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the project list envelope (data + pagination)."""
         return await self._transport.request_json("GET", "/projects", params=query)
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a project."""
         return (await self._transport.request_json("POST", "/projects", json=dict(body)))["data"]
 
     async def get(self, project: str) -> dict[str, Any]:
+        """Return a project by id or slug."""
         return (await self._transport.request_json("GET", f"/projects/{enc(project)}"))["data"]
 
     async def update(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Patch a project."""
         return (
             await self._transport.request_json(
                 "PATCH",
@@ -949,25 +1040,30 @@ class AsyncProjectsResource:
         )["data"]
 
     async def delete(self, project: str) -> None:
+        """Delete a project."""
         await self._transport.request_raw("DELETE", f"/projects/{enc(project)}")
 
     async def activate(self, project: str) -> dict[str, Any]:
+        """Activate a project."""
         return (
             await self._transport.request_json("POST", f"/projects/{enc(project)}/activate")
         )["data"]
 
     async def deactivate(self, project: str) -> dict[str, Any]:
+        """Deactivate a project."""
         return (
             await self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate")
         )["data"]
 
     async def event_handlers(self, project: str) -> dict[str, Any]:
+        """Return the project's event handlers."""
         return await self._transport.request_json(
             "GET",
             f"/projects/{enc(project)}/event-handlers",
         )
 
     async def schedules(self, project: str) -> dict[str, Any]:
+        """Return the project's schedules."""
         return await self._transport.request_json(
             "GET",
             f"/projects/{enc(project)}/schedules",
@@ -979,9 +1075,11 @@ class AsyncBuildsResource:
         self._transport = transport
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the build list envelope across all projects."""
         return await self._transport.request_json("GET", "/builds", params=query)
 
     async def list_for_project(self, project: str, **query: Any) -> dict[str, Any]:
+        """Return the build list envelope for one project."""
         return await self._transport.request_json(
             "GET",
             f"/projects/{enc(project)}/builds",
@@ -989,6 +1087,7 @@ class AsyncBuildsResource:
         )
 
     async def get(self, project: str, build_id: str) -> dict[str, Any]:
+        """Return a single build."""
         return (
             await self._transport.request_json(
                 "GET",
@@ -997,6 +1096,7 @@ class AsyncBuildsResource:
         )["data"]
 
     async def deployed(self, project: str) -> dict[str, Any]:
+        """Return the project's deployed build."""
         return (
             await self._transport.request_json(
                 "GET",
@@ -1005,6 +1105,7 @@ class AsyncBuildsResource:
         )["data"]
 
     async def live(self, project: str) -> dict[str, Any]:
+        """Return the project's live build."""
         return (
             await self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live")
         )["data"]
@@ -1017,6 +1118,7 @@ class AsyncBuildsResource:
         hash: str,
         build_id: str | None = None,
     ) -> dict[str, Any]:
+        """Upload a build archive as multipart form data."""
         data = {"hash": hash, **({"build_id": build_id} if build_id else {})}
         response = await self._transport.request_raw(
             "POST",
@@ -1028,12 +1130,14 @@ class AsyncBuildsResource:
         return response.json()["data"]
 
     async def download(self, project: str, build_id: str):
+        """Return the raw HTTP response streaming the build archive."""
         return await self._transport.request_raw(
             "GET",
             f"/projects/{enc(project)}/builds/{enc(build_id)}/download",
         )
 
     async def deploy(self, project: str, build_id: str) -> dict[str, Any]:
+        """Deploy a build."""
         return (
             await self._transport.request_json(
                 "POST",
@@ -1047,9 +1151,11 @@ class AsyncContextResource:
         self._transport = transport
 
     async def list(self, project: str) -> dict[str, Any]:
+        """Return the context variable list envelope for a project."""
         return await self._transport.request_json("GET", f"/projects/{enc(project)}/context")
 
     async def create(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a context variable."""
         return (
             await self._transport.request_json(
                 "POST",
@@ -1059,6 +1165,7 @@ class AsyncContextResource:
         )["data"]
 
     async def update(self, project: str, key: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace a context variable."""
         return (
             await self._transport.request_json(
                 "PUT",
@@ -1068,6 +1175,7 @@ class AsyncContextResource:
         )["data"]
 
     async def delete(self, project: str, key: str) -> None:
+        """Delete a context variable."""
         await self._transport.request_raw(
             "DELETE",
             f"/projects/{enc(project)}/context/{enc(key)}",
@@ -1079,18 +1187,23 @@ class AsyncDomainsResource:
         self._transport = transport
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Register a custom domain."""
         return (await self._transport.request_json("POST", "/domains", json=dict(body)))["data"]
 
     async def list(self) -> dict[str, Any]:
+        """Return the domain list envelope."""
         return await self._transport.request_json("GET", "/domains")
 
     async def get(self, domain_id: str) -> dict[str, Any]:
+        """Return a single domain."""
         return (await self._transport.request_json("GET", f"/domains/{enc(domain_id)}"))["data"]
 
     async def delete(self, domain_id: str) -> None:
+        """Delete a domain."""
         await self._transport.request_raw("DELETE", f"/domains/{enc(domain_id)}")
 
     async def verify(self, domain_id: str) -> dict[str, Any]:
+        """Trigger domain verification."""
         return (
             await self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify")
         )["data"]
@@ -1101,15 +1214,19 @@ class AsyncSessionsResource:
         self._transport = transport
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a scoped session."""
         return (await self._transport.request_json("POST", "/sessions", json=dict(body)))["data"]
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the session list envelope."""
         return await self._transport.request_json("GET", "/sessions", params=query)
 
     async def revoke(self, session_id: str) -> None:
+        """Revoke one session."""
         await self._transport.request_raw("DELETE", f"/sessions/{enc(session_id)}")
 
     async def revoke_all(self) -> dict[str, Any]:
+        """Revoke every session."""
         return (await self._transport.request_json("DELETE", "/sessions"))["data"]
 
 
@@ -1118,14 +1235,17 @@ class AsyncServiceKeysResource:
         self._transport = transport
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a scoped service key."""
         return (
             await self._transport.request_json("POST", "/service-keys", json=dict(body))
         )["data"]
 
     async def list(self, **query: Any) -> dict[str, Any]:
+        """Return the service key list envelope."""
         return await self._transport.request_json("GET", "/service-keys", params=query)
 
     async def get(self, service_key_id: str) -> dict[str, Any]:
+        """Return a single service key."""
         return (
             await self._transport.request_json(
                 "GET",
@@ -1134,6 +1254,7 @@ class AsyncServiceKeysResource:
         )["data"]
 
     async def update(self, service_key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Patch a service key."""
         return (
             await self._transport.request_json(
                 "PATCH",
@@ -1143,9 +1264,11 @@ class AsyncServiceKeysResource:
         )["data"]
 
     async def revoke(self, service_key_id: str) -> None:
+        """Revoke one service key."""
         await self._transport.request_raw("DELETE", f"/service-keys/{enc(service_key_id)}")
 
     async def revoke_all(self) -> dict[str, Any]:
+        """Revoke every service key."""
         return (await self._transport.request_json("DELETE", "/service-keys"))["data"]
 
 
@@ -1158,6 +1281,7 @@ async def aiter_stream(
     params: Mapping[str, Any] | None = None,
     timeout: httpx.Timeout | None = None,
 ) -> AsyncIterator[StreamEvent]:
+    """Open an SSE request and yield decoded stream events."""
     extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     async with transport.client.stream(
         method,
