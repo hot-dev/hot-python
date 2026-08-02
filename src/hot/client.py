@@ -19,6 +19,7 @@ from .resources import (
     AsyncServiceKeysResource,
     AsyncSessionsResource,
     AsyncStreamsResource,
+    AsyncTasksResource,
     BuildsResource,
     ContextResource,
     DomainsResource,
@@ -31,6 +32,7 @@ from .resources import (
     ServiceKeysResource,
     SessionsResource,
     StreamsResource,
+    TasksResource,
 )
 
 
@@ -63,6 +65,7 @@ class HotClient:
         self.service_keys = ServiceKeysResource(self._transport)
         self.sessions = SessionsResource(self._transport)
         self.streams = StreamsResource(self._transport)
+        self.tasks = TasksResource(self._transport)
 
     @property
     def token(self) -> str:
@@ -131,6 +134,7 @@ class AsyncHotClient:
         self.service_keys = AsyncServiceKeysResource(self._transport)
         self.sessions = AsyncSessionsResource(self._transport)
         self.streams = AsyncStreamsResource(self._transport)
+        self.tasks = AsyncTasksResource(self._transport)
 
     @property
     def token(self) -> str:

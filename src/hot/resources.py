@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from ._transport import AsyncTransport, SyncTransport, raise_for_status, without_none
+from .errors import HotRunError, HotTaskError
 from .sse import consume_sse_blocks
 from .types import StreamEvent
 
@@ -94,19 +95,10 @@ class EventsResource:
         on_chunk: Callable[[str], None] | None = None,
     ) -> Any:
         """Call a Hot function and wait for its result, unwrapping ``{"$ok": ...}``."""
-        published = self.publish(
-            {
-                "event_type": "hot:call",
-                "event_data": {
-                    "fn": fn,
-                    "args": args or [],
-                },
-            }
-        )
-        run = wait_for_run_result(
+        run = wait_for_call_result(
             self._transport,
-            published["stream_id"],
-            published["event_id"],
+            fn,
+            args or [],
             timeout=timeout,
             on_chunk=on_chunk,
         )
@@ -140,6 +132,54 @@ class RunsResource:
     def get(self, run_id: str) -> dict[str, Any]:
         """Return a single run."""
         return self._transport.request_json("GET", f"/runs/{enc(run_id)}")["data"]
+
+    def subscribe(self, run_id: str) -> Iterator[StreamEvent]:
+        """Yield durable run snapshots until the run becomes terminal."""
+        yield from iter_stream(
+            self._transport,
+            "GET",
+            f"/runs/{enc(run_id)}/subscribe",
+        )
+
+    def wait(
+        self,
+        run_id: str,
+        *,
+        timeout: float = 60.0,
+        max_attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Wait for run success; failed/cancelled runs raise HotRunError."""
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timeout waiting for run")
+            try:
+                for event in iter_stream(
+                    self._transport,
+                    "GET",
+                    f"/runs/{enc(run_id)}/subscribe",
+                    timeout=httpx.Timeout(None, read=remaining),
+                ):
+                    run = event.get("run") if event.get("type") == "run:update" else None
+                    if not isinstance(run, dict):
+                        continue
+                    status = run.get("status")
+                    if status == "succeeded":
+                        return run
+                    if status in ("failed", "cancelled"):
+                        raise HotRunError(run)
+            except HotRunError:
+                raise
+            except httpx.TimeoutException as error:
+                raise TimeoutError("Timeout waiting for run") from error
+            except httpx.HTTPError:
+                if attempts >= max_attempts:
+                    raise
+            if attempts >= max_attempts:
+                raise RuntimeError("Run subscription ended before the run completed")
+            attempts += 1
 
 
 class EnvResource:
@@ -235,6 +275,7 @@ class StreamsResource:
         seen_start: set[str] = set()
         seen_terminal: set[str] = set()
         stream_id: str | None = None
+        event_id: str | None = None
         attempts = 0
 
         while True:
@@ -252,6 +293,9 @@ class StreamsResource:
                         published = event.get("stream_id") if isinstance(event, dict) else None
                         if isinstance(published, str):
                             stream_id = published
+                        published_event = event.get("event_id")
+                        if isinstance(published_event, str):
+                            event_id = published_event
 
                     if event_type == "run:start":
                         run_id = _run_id_of(event)
@@ -266,9 +310,12 @@ class StreamsResource:
                             continue
                         if run_id:
                             seen_terminal.add(run_id)
-                        terminal = True
+                        run = event.get("run")
+                        terminal = event_id is not None and _event_id_of_run(run) == event_id
 
                     yield event
+                    if terminal:
+                        return
             except Exception:
                 if stream_id is None or attempts >= max_attempts:
                     raise
@@ -277,6 +324,8 @@ class StreamsResource:
                 return
             if stream_id is None:
                 raise RuntimeError("stream ended before event:published was received")
+            if attempts >= max_attempts:
+                raise RuntimeError("stream ended before the published event's run completed")
 
             attempts += 1
             time.sleep(min(0.25 * attempts, 2.0))
@@ -294,6 +343,63 @@ class StreamsResource:
             json=dict(body),
             params={"project": project},
         )
+
+
+class TasksResource:
+    def __init__(self, transport: SyncTransport) -> None:
+        self._transport = transport
+
+    def get(self, task_id: str) -> dict[str, Any]:
+        """Return the latest durable task snapshot."""
+        return self._transport.request_json("GET", f"/tasks/{enc(task_id)}")["data"]
+
+    def subscribe(self, task_id: str) -> Iterator[StreamEvent]:
+        """Yield durable task snapshots until the task becomes terminal."""
+        yield from iter_stream(
+            self._transport,
+            "GET",
+            f"/tasks/{enc(task_id)}/subscribe",
+        )
+
+    def wait(
+        self,
+        task_id: str,
+        *,
+        timeout: float = 60.0,
+        max_attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Wait for task completion; failed/cancelled/timed-out tasks raise HotTaskError."""
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timeout waiting for task")
+            try:
+                for event in iter_stream(
+                    self._transport,
+                    "GET",
+                    f"/tasks/{enc(task_id)}/subscribe",
+                    timeout=httpx.Timeout(None, read=remaining),
+                ):
+                    task = event.get("task") if event.get("type") == "task:update" else None
+                    if not isinstance(task, dict):
+                        continue
+                    status = task.get("status")
+                    if status == "completed":
+                        return task
+                    if status in ("failed", "cancelled", "timed_out"):
+                        raise HotTaskError(task)
+            except HotTaskError:
+                raise
+            except httpx.TimeoutException as error:
+                raise TimeoutError("Timeout waiting for task") from error
+            except httpx.HTTPError:
+                if attempts >= max_attempts:
+                    raise
+            if attempts >= max_attempts:
+                raise RuntimeError("Task subscription ended before the task completed")
+            attempts += 1
 
 
 class FilesResource:
@@ -395,9 +501,7 @@ class ProjectsResource:
 
     def deactivate(self, project: str) -> dict[str, Any]:
         """Deactivate a project."""
-        return self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate")[
-            "data"
-        ]
+        return self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate")["data"]
 
     def event_handlers(self, project: str) -> dict[str, Any]:
         """Return the project's event handlers."""
@@ -440,9 +544,7 @@ class BuildsResource:
 
     def live(self, project: str) -> dict[str, Any]:
         """Return the project's live build."""
-        return self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live")[
-            "data"
-        ]
+        return self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live")["data"]
 
     def upload(
         self,
@@ -632,45 +734,120 @@ def wait_for_run_result(
     *,
     timeout: float = 60.0,
     on_chunk: Callable[[str], None] | None = None,
+    max_attempts: int = 5,
 ) -> dict[str, Any]:
     """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
     deadline = time.monotonic() + timeout
     current_run_id: str | None = None
 
-    # The read timeout aborts a silent stream; the per-event deadline check
-    # below bounds streams that keep trickling events past the deadline.
-    try:
-        for event in iter_stream(
-            transport,
-            "GET",
-            f"/streams/{enc(stream_id)}/subscribe",
-            timeout=httpx.Timeout(None, read=timeout),
-        ):
-            if time.monotonic() > deadline:
-                raise TimeoutError("Timeout waiting for run result")
+    attempts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timeout waiting for run result")
+        try:
+            for event in iter_stream(
+                transport,
+                "GET",
+                f"/streams/{enc(stream_id)}/subscribe",
+                timeout=httpx.Timeout(None, read=remaining),
+            ):
+                current_run_id, run = _handle_run_event(event, event_id, current_run_id, on_chunk)
+                if run is not None:
+                    return run
+        except httpx.TimeoutException as error:
+            raise TimeoutError("Timeout waiting for run result") from error
+        except httpx.HTTPError:
+            if attempts >= max_attempts:
+                raise
+        if attempts >= max_attempts:
+            raise RuntimeError("Stream ended before run completed")
+        attempts += 1
 
-            if event.get("type") == "run:start":
-                run = event.get("run")
-                if _event_id_of_run(run) == event_id:
-                    current_run_id = _run_id_of(event)
 
-            if current_run_id and event.get("type") == "stream:data":
-                if event.get("run_id") == current_run_id:
-                    _emit_chunk(event, on_chunk)
+def wait_for_call_result(
+    transport: SyncTransport,
+    fn: str,
+    args: list[Any],
+    *,
+    timeout: float = 60.0,
+    on_chunk: Callable[[str], None] | None = None,
+    max_attempts: int = 5,
+) -> dict[str, Any]:
+    """Atomically publish hot:call and wait for its correlated run."""
+    deadline = time.monotonic() + timeout
+    stream_id: str | None = None
+    event_id: str | None = None
+    current_run_id: str | None = None
+    attempts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timeout waiting for run result")
+        method = "POST" if stream_id is None else "GET"
+        path = (
+            "/streams/subscribe-with-event"
+            if stream_id is None
+            else f"/streams/{enc(stream_id)}/subscribe"
+        )
+        body = (
+            {"event_type": "hot:call", "event_data": {"fn": fn, "args": args}}
+            if stream_id is None
+            else None
+        )
+        try:
+            for event in iter_stream(
+                transport,
+                method,
+                path,
+                json=body,
+                timeout=httpx.Timeout(None, read=remaining),
+            ):
+                if event.get("type") == "event:published":
+                    published_stream = event.get("stream_id")
+                    published_event = event.get("event_id")
+                    if isinstance(published_stream, str):
+                        stream_id = published_stream
+                    if isinstance(published_event, str):
+                        event_id = published_event
+                if event_id is not None:
+                    current_run_id, run = _handle_run_event(
+                        event, event_id, current_run_id, on_chunk
+                    )
+                    if run is not None:
+                        return run
+        except httpx.TimeoutException as error:
+            raise TimeoutError("Timeout waiting for run result") from error
+        except httpx.HTTPError:
+            if stream_id is None or attempts >= max_attempts:
+                raise
+        if stream_id is None or event_id is None:
+            raise RuntimeError("stream ended before event:published was received")
+        if attempts >= max_attempts:
+            raise RuntimeError("Stream ended before run completed")
+        attempts += 1
 
-            if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
-                run = event.get("run")
-                if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
-                    continue
-                if event.get("type") == "run:fail":
-                    raise RuntimeError(_run_result_message(run, "Run failed"))
-                if event.get("type") == "run:cancel":
-                    raise RuntimeError(_run_result_message(run, "Run cancelled"))
-                return run
-    except httpx.TimeoutException as error:
-        raise TimeoutError("Timeout waiting for run result") from error
 
-    raise RuntimeError("Stream ended before run completed")
+def _handle_run_event(
+    event: StreamEvent,
+    event_id: str,
+    current_run_id: str | None,
+    on_chunk: Callable[[str], None] | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if event.get("type") == "run:start" and _event_id_of_run(event.get("run")) == event_id:
+        current_run_id = _run_id_of(event)
+    if current_run_id and event.get("type") == "stream:data":
+        if event.get("run_id") == current_run_id:
+            _emit_chunk(event, on_chunk)
+    if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
+        run = event.get("run")
+        if isinstance(run, dict) and _event_id_of_run(run) == event_id:
+            if event.get("type") == "run:fail":
+                raise RuntimeError(_run_result_message(run, "Run failed"))
+            if event.get("type") == "run:cancel":
+                raise RuntimeError(_run_result_message(run, "Run cancelled"))
+            return current_run_id, run
+    return current_run_id, None
 
 
 async def async_wait_for_run_result(
@@ -680,45 +857,98 @@ async def async_wait_for_run_result(
     *,
     timeout: float = 60.0,
     on_chunk: Callable[[str], None] | None = None,
+    max_attempts: int = 5,
 ) -> dict[str, Any]:
     """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
     deadline = time.monotonic() + timeout
     current_run_id: str | None = None
 
-    # The read timeout aborts a silent stream; the per-event deadline check
-    # below bounds streams that keep trickling events past the deadline.
-    try:
-        async for event in aiter_stream(
-            transport,
-            "GET",
-            f"/streams/{enc(stream_id)}/subscribe",
-            timeout=httpx.Timeout(None, read=timeout),
-        ):
-            if time.monotonic() > deadline:
-                raise TimeoutError("Timeout waiting for run result")
+    attempts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timeout waiting for run result")
+        try:
+            async for event in aiter_stream(
+                transport,
+                "GET",
+                f"/streams/{enc(stream_id)}/subscribe",
+                timeout=httpx.Timeout(None, read=remaining),
+            ):
+                current_run_id, run = _handle_run_event(event, event_id, current_run_id, on_chunk)
+                if run is not None:
+                    return run
+        except httpx.TimeoutException as error:
+            raise TimeoutError("Timeout waiting for run result") from error
+        except httpx.HTTPError:
+            if attempts >= max_attempts:
+                raise
+        if attempts >= max_attempts:
+            raise RuntimeError("Stream ended before run completed")
+        attempts += 1
 
-            if event.get("type") == "run:start":
-                run = event.get("run")
-                if _event_id_of_run(run) == event_id:
-                    current_run_id = _run_id_of(event)
 
-            if current_run_id and event.get("type") == "stream:data":
-                if event.get("run_id") == current_run_id:
-                    _emit_chunk(event, on_chunk)
-
-            if event.get("type") in ("run:stop", "run:fail", "run:cancel"):
-                run = event.get("run")
-                if not isinstance(run, dict) or _event_id_of_run(run) != event_id:
-                    continue
-                if event.get("type") == "run:fail":
-                    raise RuntimeError(_run_result_message(run, "Run failed"))
-                if event.get("type") == "run:cancel":
-                    raise RuntimeError(_run_result_message(run, "Run cancelled"))
-                return run
-    except httpx.TimeoutException as error:
-        raise TimeoutError("Timeout waiting for run result") from error
-
-    raise RuntimeError("Stream ended before run completed")
+async def async_wait_for_call_result(
+    transport: AsyncTransport,
+    fn: str,
+    args: list[Any],
+    *,
+    timeout: float = 60.0,
+    on_chunk: Callable[[str], None] | None = None,
+    max_attempts: int = 5,
+) -> dict[str, Any]:
+    """Async atomic hot:call publish and correlated run wait."""
+    deadline = time.monotonic() + timeout
+    stream_id: str | None = None
+    event_id: str | None = None
+    current_run_id: str | None = None
+    attempts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timeout waiting for run result")
+        method = "POST" if stream_id is None else "GET"
+        path = (
+            "/streams/subscribe-with-event"
+            if stream_id is None
+            else f"/streams/{enc(stream_id)}/subscribe"
+        )
+        body = (
+            {"event_type": "hot:call", "event_data": {"fn": fn, "args": args}}
+            if stream_id is None
+            else None
+        )
+        try:
+            async for event in aiter_stream(
+                transport,
+                method,
+                path,
+                json=body,
+                timeout=httpx.Timeout(None, read=remaining),
+            ):
+                if event.get("type") == "event:published":
+                    published_stream = event.get("stream_id")
+                    published_event = event.get("event_id")
+                    if isinstance(published_stream, str):
+                        stream_id = published_stream
+                    if isinstance(published_event, str):
+                        event_id = published_event
+                if event_id is not None:
+                    current_run_id, run = _handle_run_event(
+                        event, event_id, current_run_id, on_chunk
+                    )
+                    if run is not None:
+                        return run
+        except httpx.TimeoutException as error:
+            raise TimeoutError("Timeout waiting for run result") from error
+        except httpx.HTTPError:
+            if stream_id is None or attempts >= max_attempts:
+                raise
+        if stream_id is None or event_id is None:
+            raise RuntimeError("stream ended before event:published was received")
+        if attempts >= max_attempts:
+            raise RuntimeError("Stream ended before run completed")
+        attempts += 1
 
 
 class AsyncEventsResource:
@@ -738,19 +968,10 @@ class AsyncEventsResource:
         on_chunk: Callable[[str], None] | None = None,
     ) -> Any:
         """Call a Hot function and wait for its result, unwrapping ``{"$ok": ...}``."""
-        published = await self.publish(
-            {
-                "event_type": "hot:call",
-                "event_data": {
-                    "fn": fn,
-                    "args": args or [],
-                },
-            }
-        )
-        run = await async_wait_for_run_result(
+        run = await async_wait_for_call_result(
             self._transport,
-            published["stream_id"],
-            published["event_id"],
+            fn,
+            args or [],
             timeout=timeout,
             on_chunk=on_chunk,
         )
@@ -784,6 +1005,55 @@ class AsyncRunsResource:
     async def get(self, run_id: str) -> dict[str, Any]:
         """Return a single run."""
         return (await self._transport.request_json("GET", f"/runs/{enc(run_id)}"))["data"]
+
+    async def subscribe(self, run_id: str) -> AsyncIterator[StreamEvent]:
+        """Yield durable run snapshots until the run becomes terminal."""
+        async for event in aiter_stream(
+            self._transport,
+            "GET",
+            f"/runs/{enc(run_id)}/subscribe",
+        ):
+            yield event
+
+    async def wait(
+        self,
+        run_id: str,
+        *,
+        timeout: float = 60.0,
+        max_attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Wait for run success; failed/cancelled runs raise HotRunError."""
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timeout waiting for run")
+            try:
+                async for event in aiter_stream(
+                    self._transport,
+                    "GET",
+                    f"/runs/{enc(run_id)}/subscribe",
+                    timeout=httpx.Timeout(None, read=remaining),
+                ):
+                    run = event.get("run") if event.get("type") == "run:update" else None
+                    if not isinstance(run, dict):
+                        continue
+                    status = run.get("status")
+                    if status == "succeeded":
+                        return run
+                    if status in ("failed", "cancelled"):
+                        raise HotRunError(run)
+            except HotRunError:
+                raise
+            except httpx.TimeoutException as error:
+                raise TimeoutError("Timeout waiting for run") from error
+            except httpx.HTTPError:
+                if attempts >= max_attempts:
+                    raise
+            if attempts >= max_attempts:
+                raise RuntimeError("Run subscription ended before the run completed")
+            attempts += 1
 
 
 class AsyncEnvResource:
@@ -877,6 +1147,7 @@ class AsyncStreamsResource:
         seen_start: set[str] = set()
         seen_terminal: set[str] = set()
         stream_id: str | None = None
+        event_id: str | None = None
         attempts = 0
 
         while True:
@@ -894,6 +1165,9 @@ class AsyncStreamsResource:
                         published = event.get("stream_id") if isinstance(event, dict) else None
                         if isinstance(published, str):
                             stream_id = published
+                        published_event = event.get("event_id")
+                        if isinstance(published_event, str):
+                            event_id = published_event
 
                     if event_type == "run:start":
                         run_id = _run_id_of(event)
@@ -908,9 +1182,12 @@ class AsyncStreamsResource:
                             continue
                         if run_id:
                             seen_terminal.add(run_id)
-                        terminal = True
+                        run = event.get("run")
+                        terminal = event_id is not None and _event_id_of_run(run) == event_id
 
                     yield event
+                    if terminal:
+                        return
             except Exception:
                 if stream_id is None or attempts >= max_attempts:
                     raise
@@ -919,6 +1196,8 @@ class AsyncStreamsResource:
                 return
             if stream_id is None:
                 raise RuntimeError("stream ended before event:published was received")
+            if attempts >= max_attempts:
+                raise RuntimeError("stream ended before the published event's run completed")
 
             attempts += 1
             await asyncio.sleep(min(0.25 * attempts, 2.0))
@@ -937,6 +1216,64 @@ class AsyncStreamsResource:
             params={"project": project},
         ):
             yield event
+
+
+class AsyncTasksResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def get(self, task_id: str) -> dict[str, Any]:
+        """Return the latest durable task snapshot."""
+        return (await self._transport.request_json("GET", f"/tasks/{enc(task_id)}"))["data"]
+
+    async def subscribe(self, task_id: str) -> AsyncIterator[StreamEvent]:
+        """Yield durable task snapshots until the task becomes terminal."""
+        async for event in aiter_stream(
+            self._transport,
+            "GET",
+            f"/tasks/{enc(task_id)}/subscribe",
+        ):
+            yield event
+
+    async def wait(
+        self,
+        task_id: str,
+        *,
+        timeout: float = 60.0,
+        max_attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Wait for task completion; failed/cancelled/timed-out tasks raise HotTaskError."""
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timeout waiting for task")
+            try:
+                async for event in aiter_stream(
+                    self._transport,
+                    "GET",
+                    f"/tasks/{enc(task_id)}/subscribe",
+                    timeout=httpx.Timeout(None, read=remaining),
+                ):
+                    task = event.get("task") if event.get("type") == "task:update" else None
+                    if not isinstance(task, dict):
+                        continue
+                    status = task.get("status")
+                    if status == "completed":
+                        return task
+                    if status in ("failed", "cancelled", "timed_out"):
+                        raise HotTaskError(task)
+            except HotTaskError:
+                raise
+            except httpx.TimeoutException as error:
+                raise TimeoutError("Timeout waiting for task") from error
+            except httpx.HTTPError:
+                if attempts >= max_attempts:
+                    raise
+            if attempts >= max_attempts:
+                raise RuntimeError("Task subscription ended before the task completed")
+            attempts += 1
 
 
 class AsyncFilesResource:
@@ -1045,15 +1382,15 @@ class AsyncProjectsResource:
 
     async def activate(self, project: str) -> dict[str, Any]:
         """Activate a project."""
-        return (
-            await self._transport.request_json("POST", f"/projects/{enc(project)}/activate")
-        )["data"]
+        return (await self._transport.request_json("POST", f"/projects/{enc(project)}/activate"))[
+            "data"
+        ]
 
     async def deactivate(self, project: str) -> dict[str, Any]:
         """Deactivate a project."""
-        return (
-            await self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate")
-        )["data"]
+        return (await self._transport.request_json("POST", f"/projects/{enc(project)}/deactivate"))[
+            "data"
+        ]
 
     async def event_handlers(self, project: str) -> dict[str, Any]:
         """Return the project's event handlers."""
@@ -1106,9 +1443,9 @@ class AsyncBuildsResource:
 
     async def live(self, project: str) -> dict[str, Any]:
         """Return the project's live build."""
-        return (
-            await self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live")
-        )["data"]
+        return (await self._transport.request_json("GET", f"/projects/{enc(project)}/builds/live"))[
+            "data"
+        ]
 
     async def upload(
         self,
@@ -1204,9 +1541,9 @@ class AsyncDomainsResource:
 
     async def verify(self, domain_id: str) -> dict[str, Any]:
         """Trigger domain verification."""
-        return (
-            await self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify")
-        )["data"]
+        return (await self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify"))[
+            "data"
+        ]
 
 
 class AsyncSessionsResource:
@@ -1236,9 +1573,9 @@ class AsyncServiceKeysResource:
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a scoped service key."""
-        return (
-            await self._transport.request_json("POST", "/service-keys", json=dict(body))
-        )["data"]
+        return (await self._transport.request_json("POST", "/service-keys", json=dict(body)))[
+            "data"
+        ]
 
     async def list(self, **query: Any) -> dict[str, Any]:
         """Return the service key list envelope."""

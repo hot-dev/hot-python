@@ -27,6 +27,39 @@ class HotApiError(Exception):
         self.error = error
 
 
+class HotTaskError(Exception):
+    """Raised when a waited task reaches a non-success terminal state."""
+
+    def __init__(self, task: dict[str, Any]) -> None:
+        result = task.get("result")
+        message = _result_message(result) or f"Task {task.get('status', 'failed')}"
+        super().__init__(message)
+        self.task = task
+
+
+class HotRunError(Exception):
+    """Raised when a waited run reaches a non-success terminal state."""
+
+    def __init__(self, run: dict[str, Any]) -> None:
+        result = run.get("result")
+        status = run.get("status", "failed")
+        message = _result_message(result) or f"Run {status}"
+        super().__init__(message)
+        self.run = run
+
+
+def _result_message(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if not isinstance(value, dict):
+        return None
+    for key in ("$err", "$val", "error", "message", "msg", "reason", "err"):
+        message = _result_message(value.get(key))
+        if message:
+            return message
+    return None
+
+
 def parse_api_error(status_code: int, text: str, headers: dict[str, str]) -> HotApiError:
     try:
         import json

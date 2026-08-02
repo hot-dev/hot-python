@@ -62,6 +62,27 @@ should call your own backend route instead of exposing a Hot API key.
 Most management endpoints require an API key. Sessions and service keys are
 permission-scoped and are mainly for event publishing and stream reads.
 
+When code has a run id but does not need the full stream, wait on its durable
+terminal snapshot:
+
+```python
+run = hot.runs.wait(run_id, timeout=300)
+print(run["result"])
+```
+
+When a run returns a background task id, wait through the durable task resource:
+
+```python
+task = hot.tasks.wait(task_id, timeout=300)
+print(task["result"])
+```
+
+The task waiter receives the latest persisted state first and reconnects, so it
+cannot miss a task that completed before subscription. A failed, cancelled, or
+timed-out task raises `HotTaskError` with the final task record.
+The task's parent stream also emits durable `task:update` events, which is
+useful when one subscription needs to coordinate several tasks.
+
 ## Async Usage
 
 ```python
@@ -118,8 +139,9 @@ requests are never retried.
 `HotClient` mirrors the Hot API v1 resources:
 
 - `hot.events` — publish, list, get, inspect event runs, and call Hot functions with `call_hot(fn, args)`
-- `hot.streams` — subscribe to run streams, wait for run results, and publish events atomically (reconnects automatically across the 5-minute SSE timeout; pass `reconnect=False` to opt out)
-- `hot.runs` — list, inspect, and view run stats
+- `hot.streams` — subscribe to run and task updates, wait for run results, and publish events atomically (reconnects automatically across the 5-minute SSE timeout; pass `reconnect=False` to opt out)
+- `hot.runs` — list, inspect, subscribe to, and wait for durable runs
+- `hot.tasks` — get, subscribe to, and wait for durable background tasks
 - `hot.files` — upload, download, list, and delete files (including multipart uploads)
 - `hot.projects` — create, list, update, activate, deactivate, and delete projects
 - `hot.builds` — upload, download, deploy, and look up live/deployed builds
@@ -135,9 +157,9 @@ endpoints that do not yet have a resource helper.
 
 `hot.env.subscribe()` requires API key credentials and a live API pub/sub
 backend; local API servers without pub/sub return a 503. `subscribe_with_event`
-reconnects across the API's 5-minute SSE timeout and stops after the first
-terminal `run:*` event it sees, so keep using the stream directly if your app
-expects multiple independent runs on the same stream.
+reconnects across the API's 5-minute SSE timeout and stops after the terminal
+run correlated to the event it published. Unrelated runs on the same stream do
+not end the iterator.
 
 ## Customizing the HTTP Client
 

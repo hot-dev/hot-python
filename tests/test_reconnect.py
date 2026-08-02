@@ -7,10 +7,7 @@ import pytest
 
 from hot import AsyncHotClient, HotClient
 
-_PUBLISHED = (
-    'data: {"type":"event:published","stream_id":"s1",'
-    '"event_id":"e1","event_type":"x"}'
-)
+_PUBLISHED = 'data: {"type":"event:published","stream_id":"s1","event_id":"e1","event_type":"x"}'
 
 
 def _sse(*lines: str) -> bytes:
@@ -61,20 +58,18 @@ def test_subscribe_with_event_reconnects_via_stream_id():
         [
             _sse(
                 _PUBLISHED,
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
             ),
             _sse(
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
-                'data: {"type":"run:stop","run":{"run_id":"r1","result":"done"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
+                'data: {"type":"run:stop","run":{"run_id":"r1","event_id":"e1","result":"done"}}',
             ),
         ]
     )
 
     with make_sync_client(handler) as hot:
         events = list(
-            hot.streams.subscribe_with_event(
-                {"event_type": "team-agent:ask", "event_data": {}}
-            )
+            hot.streams.subscribe_with_event({"event_type": "team-agent:ask", "event_data": {}})
         )
 
     assert [e["type"] for e in events] == [
@@ -93,7 +88,7 @@ def test_subscribe_with_event_reconnect_false_returns_after_first_connection():
         [
             _sse(
                 _PUBLISHED,
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
             ),
         ]
     )
@@ -115,31 +110,26 @@ def test_subscribe_with_event_dedupes_run_events_by_run_id():
         [
             _sse(
                 _PUBLISHED,
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
             ),
             _sse(
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
-                'data: {"type":"run:start","run":{"run_id":"r2"}}',
-                'data: {"type":"run:fail","run":{"run_id":"r1","result":"err"}}',
-                'data: {"type":"run:fail","run":{"run_id":"r1","result":"err"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
+                'data: {"type":"run:start","run":{"run_id":"r2","event_id":"e2"}}',
+                'data: {"type":"run:fail","run":{"run_id":"r2","event_id":"e2","result":"other"}}',
+                'data: {"type":"run:fail","run":{"run_id":"r1","event_id":"e1","result":"err"}}',
+                'data: {"type":"run:fail","run":{"run_id":"r1","event_id":"e1","result":"err"}}',
             ),
         ]
     )
 
     with make_sync_client(handler) as hot:
-        events = list(
-            hot.streams.subscribe_with_event(
-                {"event_type": "x", "event_data": {}}
-            )
-        )
+        events = list(hot.streams.subscribe_with_event({"event_type": "x", "event_data": {}}))
 
-    start_ids = [
-        e["run"]["run_id"] for e in events if e["type"] == "run:start"
-    ]
+    start_ids = [e["run"]["run_id"] for e in events if e["type"] == "run:start"]
     fail_ids = [e["run"]["run_id"] for e in events if e["type"] == "run:fail"]
 
     assert start_ids == ["r1", "r2"]
-    assert fail_ids == ["r1"]
+    assert fail_ids == ["r2", "r1"]
 
 
 def test_subscribe_with_event_raises_when_no_event_published():
@@ -147,11 +137,7 @@ def test_subscribe_with_event_raises_when_no_event_published():
 
     with make_sync_client(handler) as hot:
         with pytest.raises(RuntimeError, match="event:published"):
-            list(
-                hot.streams.subscribe_with_event(
-                    {"event_type": "x", "event_data": {}}
-                )
-            )
+            list(hot.streams.subscribe_with_event({"event_type": "x", "event_data": {}}))
 
 
 def test_async_subscribe_with_event_reconnects():
@@ -159,11 +145,11 @@ def test_async_subscribe_with_event_reconnects():
         [
             _sse(
                 _PUBLISHED,
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
             ),
             _sse(
-                'data: {"type":"run:start","run":{"run_id":"r1"}}',
-                'data: {"type":"run:stop","run":{"run_id":"r1","result":"done"}}',
+                'data: {"type":"run:start","run":{"run_id":"r1","event_id":"e1"}}',
+                'data: {"type":"run:stop","run":{"run_id":"r1","event_id":"e1","result":"done"}}',
             ),
         ]
     )

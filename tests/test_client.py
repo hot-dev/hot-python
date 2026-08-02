@@ -144,7 +144,9 @@ def test_streams_parse_sse_events():
         )
 
     with make_client(handler) as hot:
-        events = list(hot.streams.subscribe_with_event({"event_type": "team-agent:ask"}))
+        events = list(
+            hot.streams.subscribe_with_event({"event_type": "team-agent:ask"}, reconnect=False)
+        )
 
     assert events == [
         {"type": "stream:data", "data_type": "text", "payload": "hi"},
@@ -176,21 +178,15 @@ def test_api_error_is_structured():
     assert exc.value.request_id == "req_123"
     assert exc.value.retry_after == 5
 
+
 def test_call_hot_uses_nested_run_failure_result():
     responses = iter(
         [
             httpx.Response(
                 200,
-                json=envelope(
-                    {
-                        "event_id": "evt_123",
-                        "stream_id": "str_123",
-                    }
-                ),
-            ),
-            httpx.Response(
-                200,
                 content=(
+                    'data: {"type":"event:published","event_id":"evt_123",'
+                    '"stream_id":"str_123"}\n\n'
                     'data: {"type":"run:start","run":{"run_id":"run_123",'
                     '"event_id":"evt_123"}}\n\n'
                     'data: {"type":"run:fail","run":{"run_id":"run_123",'
@@ -198,7 +194,7 @@ def test_call_hot_uses_nested_run_failure_result():
                     '"result":{"$err":{"message":"boom"}}}}\n\n'
                 ),
                 headers={"content-type": "text/event-stream"},
-            ),
+            )
         ]
     )
 
@@ -215,16 +211,9 @@ def test_call_hot_surfaces_hot_run_failure_shape():
         [
             httpx.Response(
                 200,
-                json=envelope(
-                    {
-                        "event_id": "evt_123",
-                        "stream_id": "str_123",
-                    }
-                ),
-            ),
-            httpx.Response(
-                200,
                 content=(
+                    'data: {"type":"event:published","event_id":"evt_123",'
+                    '"stream_id":"str_123"}\n\n'
                     'data: {"type":"run:start","run":{"run_id":"run_123",'
                     '"event_id":"evt_123"}}\n\n'
                     'data: {"type":"run:fail","run":{"run_id":"run_123",'
@@ -234,7 +223,7 @@ def test_call_hot_surfaces_hot_run_failure_shape():
                     '"$val":{"msg":"too hot","err":"too hot"}}}}\n\n'
                 ),
                 headers={"content-type": "text/event-stream"},
-            ),
+            )
         ]
     )
 
