@@ -1,15 +1,33 @@
 // Deterministic handlers and functions exercised by the SDK integration tests.
-// Every SDK's integration suite drives the same three flows:
+// Every SDK's integration suite drives the same four flows:
 //   - publish "sdk:echo" and read the run result back over SSE
+//   - publish "sdk:task", extract its user-shaped task ID, and await the task
 //   - hot:call ::fixture::sdk/add-nums for the call/wait helper
 //   - publish "sdk:fail" to observe the run:fail error path
 ::fixture::sdk ns
+
+::task ::hot::task
 
 // Echoes the event payload back as the run result.
 on-sdk-echo
 meta {on-event: "sdk:echo"}
 fn (event) {
   {echoed: event.data}
+}
+
+// Runs asynchronously after on-sdk-task returns its task ID to the SDK.
+complete-background-work
+fn (args: Any): Map {
+  {processed: args.value}
+}
+
+// Starts a durable task without awaiting it. The nested run-result shape is
+// intentionally owned by this handler; SDK callers decide how to extract IDs.
+on-sdk-task
+meta {on-event: "sdk:task"}
+fn (event) {
+  info ::task/start(::fixture::sdk/complete-background-work, event.data)
+  {work: {task: info.id}}
 }
 
 // Always fails, with a stable message the tests assert on.

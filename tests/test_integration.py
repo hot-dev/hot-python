@@ -52,6 +52,44 @@ def test_subscribe_with_event_echo(hot: HotClient) -> None:
     assert result == {"echoed": {"text": "hello"}}
 
 
+def test_wait_for_task_started_by_event_handler(hot: HotClient) -> None:
+    task_id = None
+    handler_run_id = None
+    stream_id = None
+    for event in hot.streams.subscribe_with_event(
+        {"event_type": "sdk:task", "event_data": {"value": "hello"}}
+    ):
+        if event["type"] in ("run:fail", "run:cancel"):
+            pytest.fail(f"run did not complete: {event}")
+        if event["type"] == "run:stop":
+            task_id = event["run"]["result"]["work"]["task"]
+            handler_run_id = event["run"]["run_id"]
+            stream_id = event["run"]["stream_id"]
+            break
+
+    assert isinstance(task_id, str)
+    assert hot.runs.wait(handler_run_id, timeout=60)["status"] == "succeeded"
+
+    streamed_task = None
+    for event in hot.streams.subscribe(stream_id):
+        if event.get("type") != "task:update":
+            continue
+        task = event.get("task")
+        if not isinstance(task, dict) or task.get("task_id") != task_id:
+            continue
+        if task.get("status") in ("failed", "cancelled", "timed_out"):
+            pytest.fail(f"task did not complete: {task}")
+        if task.get("status") == "completed":
+            streamed_task = task
+            break
+
+    assert streamed_task is not None
+    assert streamed_task["result"] == {"processed": "hello"}
+    task = hot.tasks.wait(task_id, timeout=60)
+    assert task["status"] == "completed"
+    assert task["result"] == {"processed": "hello"}
+
+
 def test_call_hot_add_nums(hot: HotClient) -> None:
     assert hot.events.call_hot("::fixture::sdk/add-nums", [2, 3]) == 5
 
