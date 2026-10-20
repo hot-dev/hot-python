@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Python ${{ matrix.python-version }}
@@ -59,7 +62,7 @@ jobs:
           .venv/bin/python -m pip install -e ".[dev]"
 
       - name: Install hot
-        uses: hot-dev/setup-hot@v1
+        uses: hot-dev/setup-hot@92cf9e03f49293fb31f28a56ed2c85a3424d90ad # v1
 
       - name: Run integration tests
         run: ./integration/run.sh
