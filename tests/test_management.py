@@ -6,15 +6,23 @@ import json
 import httpx
 import pytest
 
-from hot import AsyncHotManagementClient, HotApiError, HotClient, HotManagementClient
+from hot import (
+    AsyncHotClient,
+    AsyncHotManagementClient,
+    HotApiError,
+    HotClient,
+    HotManagementClient,
+)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_management_wire_contract(asynchronous):
     seen = []
+    wire = []
 
     def handler(request):
         assert request.headers["authorization"] == "Bearer hm_test"
+        wire.append(request.url.raw_path.split(b"?")[0])
         body = json.loads(request.content) if request.content else None
         seen.append((request.method, request.url.path, body, dict(request.url.params)))
         if request.method == "PATCH":
@@ -55,11 +63,13 @@ def test_management_wire_contract(asynchronous):
         ("POST", "/v1/management/children/child/one/environments/env/two/api-keys", key, {}),
         ("GET", "/v1/management/usage", None, {}),
     ]
-    # httpx.url.path is decoded; assert encoded segments on the actual wire too.
+    assert wire[2] == b"/v1/management/children/child%2Fone/state"
+    assert wire[4] == b"/v1/management/children/child%2Fone/environments/env%2Ftwo/api-keys"
 
 
 @pytest.mark.parametrize("status", [401, 403])
-def test_stream_reconnect_stops_on_authorization_failure(status, monkeypatch):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_stream_reconnect_stops_on_authorization_failure(status, asynchronous, monkeypatch):
     calls = []
     monkeypatch.setattr("hot.resources.time.sleep", lambda _: None)
 
@@ -73,10 +83,24 @@ def test_stream_reconnect_stops_on_authorization_failure(status, monkeypatch):
             )
         return httpx.Response(status, json={"error": {"code": "denied", "message": "revoked"}})
 
-    with HotClient(
-        token="test", client=httpx.Client(transport=httpx.MockTransport(handler))
-    ) as hot:
-        with pytest.raises(HotApiError) as error:
-            list(hot.streams.subscribe_with_event({"event_type": "sdk:echo", "event_data": {}}))
-    assert error.value.status_code == status
+    async def run():
+        async with AsyncHotClient(
+            token="test", client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        ) as hot:
+            with pytest.raises(HotApiError) as error:
+                async for _ in hot.streams.subscribe_with_event(
+                    {"event_type": "sdk:echo", "event_data": {}}
+                ):
+                    pass
+            assert error.value.status_code == status
+
+    if asynchronous:
+        asyncio.run(run())
+    else:
+        with HotClient(
+            token="test", client=httpx.Client(transport=httpx.MockTransport(handler))
+        ) as hot:
+            with pytest.raises(HotApiError) as error:
+                list(hot.streams.subscribe_with_event({"event_type": "sdk:echo", "event_data": {}}))
+        assert error.value.status_code == status
     assert len(calls) == 2
