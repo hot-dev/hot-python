@@ -48,7 +48,8 @@ SDK's sub-org tests explicitly, so their usual unit-test skips cannot hide a
 failure. It uses only disposable local credentials and does not deploy Hot.
 
 When the API contract changes, update the full server commit in
-`integration/hot-server.ref`, refresh the OpenAPI fixture, and rerun isolation
+`integration/hot-server.ref` and the matching immutable checkout SHA in CI,
+refresh the OpenAPI fixture, and rerun isolation
 before committing. Keep this pin aligned across all five SDK repos. The legacy
 runtime integration job remains a check against the released Hot CLI.
 
@@ -58,4 +59,15 @@ locally against the restricted-role PostgreSQL fixture: JavaScript 2 tests,
 Python 3, Go 2, Rust 2, and Java 2, with all 68 live OpenAPI operations checked
 on every run. The five shared management examples in Hot's SDK guide compiled
 and ran against that fixture as well. These were native macOS runs; hosted
-GitHub Actions and the Linux source build have not run for these unpushed changes.
+GitHub Actions and Linux source builds had not yet run at initial validation.
+The draft PR checks provide the hosted validation.
+
+CI security review: third-party Actions and the server checkout use immutable
+commit SHAs. The job verifies the checked-out server against `hot-server.ref`;
+no step output selects executable server code. Disposable test credentials are
+passed as JSON in `HOT_TEST_SUBORG_FIXTURE` to the test subprocess, rather than
+written to disk. These changes preserve the restricted runtime-role assertions.
+
+After the security fixes, the exact PostgreSQL CI commands passed again in all
+five SDKs (11 tests total), as did the JavaScript/Python/Go/Rust unit checks and
+workflow linting. Java recompiled and ran its changed integration tests.

@@ -9,7 +9,6 @@ import asyncio
 import json
 import os
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -27,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def fixture():
-    return json.loads(Path(os.environ["HOT_TEST_SUBORG_FIXTURE"]).read_text())
+    return json.loads(os.environ["HOT_TEST_SUBORG_FIXTURE"])
 
 
 def runtime(token):

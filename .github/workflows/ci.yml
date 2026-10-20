@@ -84,24 +84,23 @@ jobs:
 
       # A released CLI may lag these API changes. Pin the tested server source
       # separately so its schema, runtime qualification, and OpenAPI agree.
-      - name: Read matching Hot revision
-        id: hot-ref
-        shell: bash
-        run: |
-          revision="$(cat integration/hot-server.ref)"
-          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "integration/hot-server.ref must contain a full commit SHA" >&2
-            exit 1
-          fi
-          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
-
       - name: Checkout matching Hot server
         uses: actions/checkout@v5
         with:
           repository: hot-dev/hot
-          ref: ${{ steps.hot-ref.outputs.revision }}
+          ref: 1e0dc8deeba98b0c4bc968c9d64457c7f96c8d1a # Keep aligned with integration/hot-server.ref
           path: .hot-server
           persist-credentials: false
+
+      - name: Verify matching Hot revision
+        shell: bash
+        run: |
+          expected="$(cat integration/hot-server.ref)"
+          actual="$(git -C .hot-server rev-parse HEAD)"
+          if [[ "$expected" != "$actual" ]]; then
+            echo "Hot checkout and integration/hot-server.ref must match" >&2
+            exit 1
+          fi
 
       - name: Set up Python for the fixture
         uses: actions/setup-python@v6
@@ -115,15 +114,15 @@ jobs:
           docker version
 
       - name: Install server Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.99.1"
 
       - name: Cache matching server build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: .hot-server -> target
-          key: postgres-isolation-${{ steps.hot-ref.outputs.revision }}
+          key: postgres-isolation-${{ hashFiles('integration/hot-server.ref') }}
           cache-workspace-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 

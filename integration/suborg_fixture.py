@@ -426,11 +426,12 @@ def main():
                     db.commit()
             if args.backend == "sqlite":
                 db.close()
-            fixture_path = work / "credentials.json"
-            fixture_path.write_text(json.dumps(fixture))
-            fixture_path.chmod(0o600)
+            # Pass disposable credentials only to the test subprocess; never
+            # persist them in a fixture file or upload them as an artifact.
             test_env = env.copy()
-            test_env.update(HOT_TEST_BASE_URL=base_url, HOT_TEST_SUBORG_FIXTURE=str(fixture_path))
+            test_env.update(
+                HOT_TEST_BASE_URL=base_url, HOT_TEST_SUBORG_FIXTURE=json.dumps(fixture)
+            )
             print(f"Running sub-org integration against {args.backend}", flush=True)
             result = subprocess.run(command, env=test_env)
             if result.returncode:
