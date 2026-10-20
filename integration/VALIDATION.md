@@ -37,3 +37,25 @@ Rust 1.99.1, and JDK 21.0.12.1. Linux and minimum-toolchain checks remain in CI.
 
 No hierarchy changes or shared deployments are included. The server contract
 remains a root with direct children, each owning its environments/deployments.
+
+## PostgreSQL isolation in CI
+
+The `PostgreSQL Sub-org Isolation` job in `.github/workflows/ci.yml` runs on
+pull requests and main-branch pushes. It builds the server revision pinned in
+`integration/hot-server.ref`, then invokes the same restricted-role PostgreSQL
+fixture used locally. The job checks all live OpenAPI operations and runs the
+SDK's sub-org tests explicitly, so their usual unit-test skips cannot hide a
+failure. It uses only disposable local credentials and does not deploy Hot.
+
+When the API contract changes, update the full server commit in
+`integration/hot-server.ref`, refresh the OpenAPI fixture, and rerun isolation
+before committing. Keep this pin aligned across all five SDK repos. The legacy
+runtime integration job remains a check against the released Hot CLI.
+
+Validation of this CI addition on 2026-10-20: Actionlint (including ShellCheck)
+passed for all five workflows. Each job's final test command also passed
+locally against the restricted-role PostgreSQL fixture: JavaScript 2 tests,
+Python 3, Go 2, Rust 2, and Java 2, with all 68 live OpenAPI operations checked
+on every run. The five shared management examples in Hot's SDK guide compiled
+and ran against that fixture as well. These were native macOS runs; hosted
+GitHub Actions and the Linux source build have not run for these unpushed changes.
