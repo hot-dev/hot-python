@@ -60,5 +60,11 @@
   { "method": "POST", "path": "/v1/files/uploads" },
   { "method": "PUT", "path": "/v1/files/uploads/{upload_id}/{part_number}" },
   { "method": "POST", "path": "/v1/files/uploads/{upload_id}/complete" },
-  { "method": "DELETE", "path": "/v1/files/uploads/{upload_id}" }
+  { "method": "DELETE", "path": "/v1/files/uploads/{upload_id}" },
+  { "method": "GET", "path": "/v1/management/children" },
+  { "method": "POST", "path": "/v1/management/children" },
+  { "method": "POST", "path": "/v1/management/children/{child_id}/environments" },
+  { "method": "POST", "path": "/v1/management/children/{child_id}/environments/{env_id}/api-keys" },
+  { "method": "PATCH", "path": "/v1/management/children/{child_id}/state" },
+  { "method": "GET", "path": "/v1/management/usage" }
 ]

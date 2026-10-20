@@ -66,3 +66,87 @@ jobs:
 
       - name: Run integration tests
         run: ./integration/run.sh
+
+  postgres-isolation:
+    name: PostgreSQL Sub-org Isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_NET_RETRY: "2"
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Checkout SDK
+        uses: actions/checkout@v5
+
+      # A released CLI may lag these API changes. Pin the tested server source
+      # separately so its schema, runtime qualification, and OpenAPI agree.
+      - name: Checkout matching Hot server
+        uses: actions/checkout@v5
+        with:
+          repository: hot-dev/hot
+          ref: 1e0dc8deeba98b0c4bc968c9d64457c7f96c8d1a # Keep aligned with integration/hot-server.ref
+          path: .hot-server
+          persist-credentials: false
+
+      - name: Verify matching Hot revision
+        shell: bash
+        run: |
+          expected="$(cat integration/hot-server.ref)"
+          actual="$(git -C .hot-server rev-parse HEAD)"
+          if [[ "$expected" != "$actual" ]]; then
+            echo "Hot checkout and integration/hot-server.ref must match" >&2
+            exit 1
+          fi
+
+      - name: Set up Python for the fixture
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install build and PostgreSQL client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev cmake clang lld postgresql-client
+          docker version
+
+      - name: Install server Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.1"
+
+      - name: Cache matching server build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: .hot-server -> target
+          key: postgres-isolation-${{ hashFiles('integration/hot-server.ref') }}
+          cache-workspace-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Tailwind for the server build
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/hot-sdk-bin"
+          curl -fsSL --retry 3 \
+            https://github.com/tailwindlabs/tailwindcss/releases/download/v4.3.0/tailwindcss-linux-x64 \
+            -o "$RUNNER_TEMP/hot-sdk-bin/tailwindcss"
+          chmod +x "$RUNNER_TEMP/hot-sdk-bin/tailwindcss"
+          echo "$RUNNER_TEMP/hot-sdk-bin" >> "$GITHUB_PATH"
+
+      - name: Build matching Hot CLI
+        working-directory: .hot-server
+        run: cargo build --locked --package hot_cli --jobs 4
+
+      - name: Install Python SDK dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Test PostgreSQL isolation with restricted runtime credentials
+        run: |
+          python3 integration/suborg_fixture.py \
+            --backend postgres \
+            --hot .hot-server/target/debug/hot \
+            --hot-repo .hot-server \
+            -- python -m pytest tests/test_suborg_integration.py -v

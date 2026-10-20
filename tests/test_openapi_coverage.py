@@ -4,11 +4,21 @@ import json
 from pathlib import Path
 from typing import Any
 
-from hot import HotClient
+from hot import HotClient, HotManagementClient
 
 OPERATIONS_PATH = Path(__file__).with_name("openapi_operations.json")
 
 COVERAGE: dict[str, dict[str, str | bool]] = {
+    "GET /v1/management/children": {"sdk": "management.list_children"},
+    "POST /v1/management/children": {"sdk": "management.create_child"},
+    "PATCH /v1/management/children/{child_id}/state": {"sdk": "management.set_child_state"},
+    "POST /v1/management/children/{child_id}/environments": {
+        "sdk": "management.create_environment"
+    },
+    "POST /v1/management/children/{child_id}/environments/{env_id}/api-keys": {
+        "sdk": "management.create_api_key"
+    },
+    "GET /v1/management/usage": {"sdk": "management.usage"},
     "GET /status": {
         "ignored": True,
         "reason": "Public health endpoint, not part of authenticated SDK resources.",
@@ -108,6 +118,9 @@ def operation_key(operation: dict[str, Any]) -> str:
 
 def resolve_sdk_method(client: HotClient, path: str) -> Any:
     value: Any = client
+    if path.startswith("management."):
+        with HotManagementClient(token="hm_test") as management:
+            return getattr(management, path.split(".", 1)[1])
     for part in path.split("."):
         value = getattr(value, part)
     return value

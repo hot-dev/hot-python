@@ -9,7 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from ._transport import AsyncTransport, SyncTransport, raise_for_status, without_none
-from .errors import HotRunError, HotTaskError
+from .errors import HotApiError, HotRunError, HotTaskError
 from .sse import consume_sse_blocks
 from .types import StreamEvent
 
@@ -316,6 +316,11 @@ class StreamsResource:
                     yield event
                     if terminal:
                         return
+            except HotApiError as error:
+                if error.status_code in (401, 403):
+                    raise
+                if stream_id is None or attempts >= max_attempts:
+                    raise
             except Exception:
                 if stream_id is None or attempts >= max_attempts:
                     raise
@@ -1188,6 +1193,11 @@ class AsyncStreamsResource:
                     yield event
                     if terminal:
                         return
+            except HotApiError as error:
+                if error.status_code in (401, 403):
+                    raise
+                if stream_id is None or attempts >= max_attempts:
+                    raise
             except Exception:
                 if stream_id is None or attempts >= max_attempts:
                     raise
