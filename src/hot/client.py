@@ -7,6 +7,8 @@ import httpx
 
 from ._transport import AsyncTransport, SyncTransport
 from .resources import (
+    ApiKeysResource,
+    AsyncApiKeysResource,
     AsyncBuildsResource,
     AsyncContextResource,
     AsyncDomainsResource,
@@ -14,6 +16,7 @@ from .resources import (
     AsyncEventsResource,
     AsyncFilesResource,
     AsyncOrgResource,
+    AsyncOrgsResource,
     AsyncProjectsResource,
     AsyncRunsResource,
     AsyncServiceKeysResource,
@@ -27,6 +30,7 @@ from .resources import (
     EventsResource,
     FilesResource,
     OrgResource,
+    OrgsResource,
     ProjectsResource,
     RunsResource,
     ServiceKeysResource,
@@ -37,7 +41,14 @@ from .resources import (
 
 
 class HotClient:
-    """Synchronous Hot API client."""
+    """Synchronous Hot API client.
+
+    Pass an environment API key (or a service key or session) for runtime
+    resources, or an org API key for ``orgs`` and ``api_keys``. A call with the
+    other kind of key raises :class:`hot.HotKeyScopeError`. ``timeout``
+    defaults to 60 s per read and 10 s to connect; pass ``httpx.Timeout(None)``
+    to disable it. Streams and waiters set their own timeouts.
+    """
 
     def __init__(
         self,
@@ -53,6 +64,7 @@ class HotClient:
             timeout=timeout,
             client=client,
         )
+        self.api_keys = ApiKeysResource(self._transport)
         self.builds = BuildsResource(self._transport)
         self.context = ContextResource(self._transport)
         self.domains = DomainsResource(self._transport)
@@ -60,6 +72,7 @@ class HotClient:
         self.events = EventsResource(self._transport)
         self.files = FilesResource(self._transport)
         self.org = OrgResource(self._transport)
+        self.orgs = OrgsResource(self._transport)
         self.projects = ProjectsResource(self._transport)
         self.runs = RunsResource(self._transport)
         self.service_keys = ServiceKeysResource(self._transport)
@@ -122,6 +135,7 @@ class AsyncHotClient:
             timeout=timeout,
             client=client,
         )
+        self.api_keys = AsyncApiKeysResource(self._transport)
         self.builds = AsyncBuildsResource(self._transport)
         self.context = AsyncContextResource(self._transport)
         self.domains = AsyncDomainsResource(self._transport)
@@ -129,6 +143,7 @@ class AsyncHotClient:
         self.events = AsyncEventsResource(self._transport)
         self.files = AsyncFilesResource(self._transport)
         self.org = AsyncOrgResource(self._transport)
+        self.orgs = AsyncOrgsResource(self._transport)
         self.projects = AsyncProjectsResource(self._transport)
         self.runs = AsyncRunsResource(self._transport)
         self.service_keys = AsyncServiceKeysResource(self._transport)

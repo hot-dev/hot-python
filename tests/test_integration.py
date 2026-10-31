@@ -118,3 +118,57 @@ def test_run_failure_message(hot: HotClient) -> None:
             published["stream_id"],
             published["event_id"],
         )
+
+
+def test_call_hot_on_chunk_receives_chunks_sent_before_run_start(hot: HotClient) -> None:
+    # Hot pushes stream:data (and run:stop) before run:start for short runs.
+    chunks: list[str] = []
+    result = hot.events.call_hot("::fixture::sdk/stream-chunks", on_chunk=chunks.append)
+    assert result == "done"
+    assert chunks == ["a", "b", "c"]
+
+
+def test_async_call_hot_on_chunk() -> None:
+    import asyncio
+
+    from hot import AsyncHotClient
+
+    async def run() -> tuple[object, list[str]]:
+        chunks: list[str] = []
+        async with AsyncHotClient(
+            token=os.environ["HOT_TEST_API_KEY"],
+            base_url=os.environ.get("HOT_TEST_BASE_URL", "http://localhost:4681"),
+        ) as client:
+            result = await client.events.call_hot(
+                "::fixture::sdk/stream-chunks", on_chunk=chunks.append
+            )
+        return result, chunks
+
+    assert asyncio.run(run()) == ("done", ["a", "b", "c"])
+
+
+def test_waiters_follow_a_retried_handler(hot: HotClient) -> None:
+    # sdk:flaky fails its first attempt (run:fail, status pending_retry); the
+    # retry run has a new event_id and origin_run_id pointing at the failure.
+    published = hot.events.publish({"event_type": "sdk:flaky", "event_data": {}})
+    run = hot.streams.wait_for_run_result(published["stream_id"], published["event_id"], timeout=60)
+    assert run["result"] == {"recovered": True, "attempt": 1}
+    assert run["origin_run_id"] is not None
+
+    events = list(hot.streams.subscribe_with_event({"event_type": "sdk:flaky", "event_data": {}}))
+    assert [event["run"]["status"] for event in events if event["type"] == "run:fail"] == [
+        "pending_retry"
+    ]
+    assert events[-1]["type"] == "run:stop"
+    assert events[-1]["run"]["result"] == {"recovered": True, "attempt": 1}
+
+
+def test_file_download_stream(hot: HotClient) -> None:
+    content = os.urandom(256 * 1024)
+    uploaded = hot.files.upload("sdk-integration/download.bin", content)
+    try:
+        with hot.files.download_stream(uploaded["file_id"]) as response:
+            assert b"".join(response.iter_bytes()) == content
+        assert hot.files.download(uploaded["file_id"]).content == content
+    finally:
+        hot.files.delete(uploaded["file_id"])

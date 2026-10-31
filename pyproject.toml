@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "hot-dev"
-version = "1.2.0"
+version = "1.3.0"
 description = "Python SDK for the Hot Dev API"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,10 +30,11 @@ Repository = "https://github.com/hot-dev/hot-python"
 Issues = "https://github.com/hot-dev/hot-python/issues"
 
 [project.optional-dependencies]
+# Pinned so CI and releases use reviewed tool versions; Dependabot bumps them.
 dev = [
-  "build>=1.2",
-  "pytest>=8.0",
-  "ruff>=0.8",
+  "build==1.6.1",
+  "pytest==9.2.0",
+  "ruff==0.17.3",
 ]
 
 [tool.hatch.build.targets.wheel]

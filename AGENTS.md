@@ -15,14 +15,21 @@ This repo contains the Python SDK for the Hot Dev API.
 ```bash
 python -m pip install -e ".[dev]"
 ruff check .
+ruff format --check src tests
 pytest
 python -m build
 ```
 
 ## CI and Releases
 
-- CI runs on pushes and pull requests to `main`: install, lint (`ruff`), test
-  (`pytest`), and build (`python -m build`) on Python 3.10–3.13.
+- CI runs on pushes and pull requests to `main`: install, lint (`ruff check`,
+  `ruff format --check`), test (`pytest`), and build (`python -m build`) on
+  Python 3.10–3.15. Dev tools are pinned in `pyproject.toml`; Dependabot bumps
+  them and the Actions weekly.
+- The "Org API isolation (PostgreSQL)" job builds the hot revision in
+  `integration/hot-server.ref` (keep the CI checkout `ref:` identical) and runs
+  `integration/suborg_fixture.py` against restricted PostgreSQL roles. A weekly
+  scheduled run builds hot `main` instead, to catch API drift.
 - PyPI releases run from tags named `v<version>` matching the
   `pyproject.toml` version.
 - Publishing uses PyPI Trusted Publishing via OIDC against the `pypi` GitHub

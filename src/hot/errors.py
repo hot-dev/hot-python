@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Literal
+
+KeyScope = Literal["org", "env"]
+
+_ORG_ROUTE = re.compile(r"/v1/(?:orgs|api-keys)(?:/|$)")
 
 
 class HotApiError(Exception):
@@ -25,6 +30,19 @@ class HotApiError(Exception):
         self.retry_after = retry_after
         self.headers = headers or {}
         self.error = error
+
+
+class HotKeyScopeError(HotApiError):
+    """Raised for ``403 key_scope_mismatch``: the credential is the wrong kind of key.
+
+    Org API keys only call ``/v1/orgs`` and ``/v1/api-keys``; environment API
+    keys, service keys and sessions only call runtime routes.
+    ``required_scope`` names the kind of key the call needs: ``"org"`` or ``"env"``.
+    """
+
+    def __init__(self, *, required_scope: KeyScope, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.required_scope: KeyScope = required_scope
 
 
 class HotTaskError(Exception):
@@ -60,7 +78,12 @@ def _result_message(value: Any) -> str | None:
     return None
 
 
-def parse_api_error(status_code: int, text: str, headers: dict[str, str]) -> HotApiError:
+def parse_api_error(
+    status_code: int,
+    text: str,
+    headers: dict[str, str],
+    path: str | None = None,
+) -> HotApiError:
     try:
         import json
 
@@ -74,6 +97,18 @@ def parse_api_error(status_code: int, text: str, headers: dict[str, str]) -> Hot
         code = str(error["code"]) if error.get("code") is not None else None
         request_id = str(error["request_id"]) if error.get("request_id") is not None else None
         retry_after = _retry_after(error.get("retry_after"), headers)
+        if status_code == 403 and code == "key_scope_mismatch":
+            scope = _required_scope(path, message)
+            return HotKeyScopeError(
+                required_scope=scope,
+                status_code=status_code,
+                message=_SCOPE_MESSAGES[scope],
+                code=code,
+                request_id=request_id,
+                retry_after=retry_after,
+                headers=headers,
+                error=error,
+            )
         return HotApiError(
             status_code=status_code,
             message=message,
@@ -90,6 +125,23 @@ def parse_api_error(status_code: int, text: str, headers: dict[str, str]) -> Hot
         retry_after=_retry_after(None, headers),
         headers=headers,
     )
+
+
+_SCOPE_MESSAGES: dict[KeyScope, str] = {
+    "org": (
+        "This call needs an org API key; environment API keys, service keys "
+        "and sessions only call runtime routes"
+    ),
+    "env": (
+        "This call needs an environment API key; org API keys only call /v1/orgs and /v1/api-keys"
+    ),
+}
+
+
+def _required_scope(path: str | None, message: str) -> KeyScope:
+    if path is not None:
+        return "org" if _ORG_ROUTE.search(path) else "env"
+    return "org" if "needs an org API key" in message else "env"
 
 
 def _retry_after(value: Any, headers: dict[str, str]) -> int | None:
