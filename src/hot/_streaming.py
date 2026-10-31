@@ -384,10 +384,12 @@ class RunCorrelator:
     """Follow the runs a published event starts on its stream, in any arrival order.
 
     A run belongs to the event when its ``event_id`` is the event's, or its
-    ``origin_run_id`` names a run that does: the retry of a failed attempt gets
-    a new ``event_id``. ``stream:data`` carries only a ``run_id``, and the
-    server can deliver it (and ``run:stop``) before ``run:start``, so chunks for
-    runs not yet correlated are held until a run event claims them.
+    ``origin_run_id`` names a run that does and its ``run_type`` is that run's:
+    the retry of a failed attempt gets a new ``event_id``. A task run also
+    names the run that started it as its origin, but has another ``run_type``.
+    ``stream:data`` carries only a ``run_id``, and the server can deliver it
+    (and ``run:stop``) before ``run:start``, so chunks for runs not yet
+    correlated are held until a run event claims them.
 
     Hot replays a retried first attempt lossily: as ``run:fail`` or even
     ``run:stop`` with status ``pending_retry``, or, once the retry is queued
@@ -403,6 +405,8 @@ class RunCorrelator:
         self.on_chunk = on_chunk
         # Correlated runs and the highest retry_attempt seen for each.
         self._runs: dict[str, int] = {}
+        # Each correlated run's run_type; a retry has its origin's.
+        self._types: dict[str, Any] = {}
         # Correlated runs that a correlated retry run names as its origin.
         self._retried: set[str] = set()
         # Run events whose origin run is not correlated yet, by origin_run_id.
@@ -453,16 +457,22 @@ class RunCorrelator:
         return run
 
     def _ties(self, run: Mapping[str, Any]) -> bool:
+        if self.event_id is not None and run.get("event_id") == self.event_id:
+            return True
+        # A task run names the run that started it as its origin too, but
+        # with another run_type; only a same-type run is a retry.
         origin = run.get("origin_run_id")
-        return (self.event_id is not None and run.get("event_id") == self.event_id) or (
-            isinstance(origin, str) and origin in self._runs
+        return (
+            isinstance(origin, str)
+            and origin in self._runs
+            and self._types[origin] == run.get("run_type")
         )
 
     def _run_event(self, event_type: str, run: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
         run_id = run["run_id"]
         origin = run.get("origin_run_id")
         if not self._ties(run):
-            if isinstance(origin, str):
+            if isinstance(origin, str) and origin not in self._runs:
                 # A retry whose origin is not known yet may still turn out to be ours.
                 self._orphans.setdefault(origin, []).append((event_type, run))
             elif self.event_id is not None:
@@ -475,10 +485,15 @@ class RunCorrelator:
             self._runs[run_id] = max(self._runs[run_id], attempt)
         else:
             self._runs[run_id] = attempt
+            self._types[run_id] = run.get("run_type")
             for held in self._held.pop(run_id, []):
                 self._held_count -= 1
                 _emit_chunk(held, self.on_chunk)
-            orphans = self._orphans.pop(run_id, [])
+            orphans = [
+                (orphan_type, orphan)
+                for orphan_type, orphan in self._orphans.pop(run_id, [])
+                if orphan.get("run_type") == self._types[run_id]
+            ]
             if orphans:
                 # A retry of this run is already on the stream.
                 self._retried.add(run_id)

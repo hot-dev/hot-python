@@ -281,3 +281,66 @@ def test_failures_without_a_scheduled_retry_are_reported_at_once():
         with pytest.raises(RuntimeError, match="last"):
             hot.streams.wait_for_run_result("s1", "e1")
     assert time.monotonic() - started < 1
+
+
+# hot_task_worker gives a task run the run that started it as origin_run_id, on
+# the same stream. It is not a retry of that run: its run_type differs.
+def task_run(event_type: str, status: str, **fields) -> dict:
+    return run(
+        event_type, "t1", status, event_id=None, origin_run_id="r1", run_type="task", **fields
+    )
+
+
+OUR_START = run("run:start", "r1", "running", run_type="event")
+OUR_STOP = run("run:stop", "r1", "succeeded", run_type="event", result="ours")
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (OUR_START, chunk("t1", "task chunk"), task_run("run:stop", "succeeded", result="task")),
+        (task_run("run:stop", "succeeded", result="task"), OUR_START),
+        (OUR_START, task_run("run:fail", "failed", retry_attempt=1, result="task failed")),
+    ],
+    ids=["task-stops-first", "task-before-our-start", "task-fails-first"],
+)
+def test_task_run_started_by_our_run_does_not_end_the_wait(events):
+    stream = sse(PUBLISHED, *events, OUR_STOP)
+    hot, ahot = serve(stream, stream, stream)
+    chunks: list[str] = []
+    with hot:
+        assert hot.events.call_hot("::f/g", on_chunk=chunks.append) == "ours"
+        streamed = list(hot.streams.subscribe_with_event({"event_type": "x"}))
+    assert chunks == []
+    assert streamed[-1]["run"]["run_id"] == "r1"
+
+    async def scenario():
+        async with ahot:
+            return await ahot.streams.wait_for_run_result("s1", "e1")
+
+    assert asyncio.run(scenario())["result"] == "ours"
+
+
+@pytest.mark.parametrize(
+    "task_first",
+    [False, True],
+    ids=["task-after-our-start", "task-before-our-start"],
+)
+def test_our_plain_failure_still_fails_at_once_with_a_task_run(task_first):
+    task = task_run("run:start", "running")
+    ours = run("run:fail", "r1", "failed", run_type="event", retry_attempt=0, result="boom")
+    events = (task, OUR_START, ours) if task_first else (OUR_START, task, ours)
+    stream = sse(PUBLISHED, *events)
+    hot, ahot = serve(stream, stream)
+    started = time.monotonic()
+    with hot:
+        with pytest.raises(RuntimeError, match="boom"):
+            hot.events.call_hot("::f/g")
+
+    async def scenario():
+        async with ahot:
+            await ahot.events.call_hot("::f/g")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(scenario())
+    assert time.monotonic() - started < 1
