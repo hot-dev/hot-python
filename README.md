@@ -180,6 +180,7 @@ retried; waiters follow the reconnect policy above.
 - `hot.files` — upload, download (`download_stream` for large files), list, and delete files (including multipart uploads)
 - `hot.projects` — create, list, update, activate, deactivate, and delete projects
 - `hot.builds` — upload, download (`download_stream`), deploy, and look up live/deployed builds
+- `hot.blobs` — download large payloads spilled to blob storage (`download_stream` streams them); needs an environment API key
 - `hot.context` — manage encrypted project context variables
 - `hot.domains` — register, verify, list, and delete custom domains
 - `hot.sessions` — create and revoke scoped sessions
@@ -225,8 +226,8 @@ When you pass your own client, the SDK does not close it on exit.
 
 ## Downloads
 
-`files.download` and `builds.download` read the whole body into memory. For
-large files, stream instead:
+`files.download`, `builds.download` and `blobs.download` read the whole body into
+memory. For large files, stream instead:
 
 ```python
 with hot.files.download_stream(file_id) as response, open("out.bin", "wb") as out:
@@ -234,6 +235,7 @@ with hot.files.download_stream(file_id) as response, open("out.bin", "wb") as ou
         out.write(chunk)
 ```
 
+`blobs.download_stream(blob_ref_id)` works the same way.
 `AsyncHotClient` offers the same with `async with` and `response.aiter_bytes()`.
 
 ## Casing Policy

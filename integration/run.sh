@@ -3,7 +3,7 @@
 #
 # Requires the `hot` CLI (https://hot.dev) and python3 on PATH. Starts a
 # dedicated dev server for the fixture project on HOT_TEST_PORT (default
-# 4725), mints a local API key directly in the fixture's sqlite database,
+# 4725), mints a local API key with `hot key create`,
 # exports HOT_TEST_BASE_URL / HOT_TEST_API_KEY, and runs the suite.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,15 +28,8 @@ done
 [ -n "$up" ] || { echo "error: hot dev did not become ready" >&2; tail -20 fixture/dev.out >&2; exit 1; }
 
 export HOT_TEST_BASE_URL="http://127.0.0.1:$PORT"
-# `hot key create` ships in hot > 2.6.1; fall back to minting directly in
-# sqlite (mint_key.py) for older CLIs. Drop the fallback once the hot
-# release containing `hot key create` is the oldest supported version.
-if HOT_TEST_API_KEY="$(cd fixture && hot key create --description sdk-integration 2>/dev/null)" && [ -n "$HOT_TEST_API_KEY" ]; then
-  echo "minted key via hot key create"
-else
-  HOT_TEST_API_KEY="$(python3 mint_key.py fixture/.hot/db/hot.sqlite.db)"
-  echo "minted key via mint_key.py (hot CLI without \`hot key create\`)"
-fi
+HOT_TEST_API_KEY="$(cd fixture && hot key create --description sdk-integration)"
+[ -n "$HOT_TEST_API_KEY" ] || { echo "error: hot key create printed no key" >&2; exit 1; }
 export HOT_TEST_API_KEY
 
 echo "hot dev ready; running integration tests..."

@@ -20,6 +20,7 @@ COVERAGE: dict[str, dict[str, str | bool]] = {
     "DELETE /v1/projects/{project_id_or_slug}": {"sdk": "projects.delete"},
     "POST /v1/projects/{project_id_or_slug}/activate": {"sdk": "projects.activate"},
     "POST /v1/projects/{project_id_or_slug}/deactivate": {"sdk": "projects.deactivate"},
+    "GET /v1/blobs/{blob_ref_id}/download": {"sdk": "blobs.download"},
     "GET /v1/builds": {"sdk": "builds.list"},
     "GET /v1/projects/{project_id_or_slug}/builds": {"sdk": "builds.list_for_project"},
     "POST /v1/projects/{project_id_or_slug}/builds": {"sdk": "builds.upload"},
@@ -97,8 +98,10 @@ COVERAGE: dict[str, dict[str, str | bool]] = {
     "POST /v1/orgs/{org_id}/api-keys": {"sdk": "orgs.create_api_key"},
     "GET /v1/orgs/{org_id}/envs/{env_id}/api-keys": {"sdk": "orgs.list_env_api_keys"},
     "POST /v1/orgs/{org_id}/envs/{env_id}/api-keys": {"sdk": "orgs.create_env_api_key"},
-    # The OpenAPI spec lists only this one of the forwarded project, build and
-    # context routes; orgs.env(...) exposes all of them.
+    # The OpenAPI spec lists only the projects and builds list routes of the
+    # forwarded project, build and context routes; orgs.env(...) exposes all of
+    # them.
+    "GET /v1/orgs/{org_id}/envs/{env_id}/builds": {"sdk": "orgs.env().builds.list"},
     "GET /v1/orgs/{org_id}/envs/{env_id}/projects": {"sdk": "orgs.env().projects.list"},
     "GET /v1/api-keys/{key_id}": {"sdk": "api_keys.get"},
     "PATCH /v1/api-keys/{key_id}": {"sdk": "api_keys.update"},
