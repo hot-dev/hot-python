@@ -55,7 +55,7 @@ the matching `@hot-dev/sdk` JavaScript release when possible.
 python3 on PATH) serving the Hot fixture project in `integration/fixture`
 (project `sdk-fixture`: an echo event handler, an always-failing handler and
 function, and hot:call targets). It binds 127.0.0.1 on HOT_TEST_PORT (default
-4725), mints a full-access API key directly in the fixture's sqlite database,
+4725), mints a full-access API key with `hot key create`,
 exports HOT_TEST_BASE_URL / HOT_TEST_API_KEY, and runs `pytest tests/test_integration.py`.
 The integration tests skip when HOT_TEST_API_KEY is unset, so regular test
 runs are unaffected. The fixture pins the API to 127.0.0.1 because binding
@@ -75,6 +75,6 @@ lockstep. Checklist for a coordinated release:
 3. Run every repo's `integration/run.sh`.
 4. Commit, tag `v<version>`, push in each repo.
 
-The integration fixture (integration/fixture, mint_key.py, run.sh) is
+The integration fixture (integration/fixture, run.sh) is
 duplicated across all five repos; the canonical copy lives in **hot-python** —
 change it there first, then sync the others.
