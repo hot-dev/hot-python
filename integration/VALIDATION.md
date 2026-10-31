@@ -2,7 +2,7 @@
 
 Validated locally on 2026-10-20 for the coordinated SDK 1.3.0 changes on
 `codex/sub-org-management-sdk`. Matching public server revision:
-`hot-dev/hot@1e0dc8deeba98b0c4bc968c9d64457c7f96c8d1a`.
+`hot-dev/hot@d5dde712f447daf88c38e5546f805496c46a2877`.
 
 | SDK | Unit/contract checks | Existing runtime integration | Sub-org SQLite | Sub-org PostgreSQL |
 | --- | --- | --- | --- | --- |

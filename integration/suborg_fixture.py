@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Run SDK tests against an owned disposable sub-org server.
 
-Canonical copy: hot-python. Requires a Hot build containing the management API.
-SQLite uses only Python and Hot. PostgreSQL additionally needs Docker, psql,
-and a sibling hot checkout for provision_runtime.sql. The API uses a separate
-NOSUPERUSER NOBYPASSRLS runtime login; migrations use the schema owner.
+Canonical copy: hot-python. Requires a Hot build with the org API
+(`/v1/orgs`, `/v1/api-keys`). SQLite uses only Python and Hot. PostgreSQL
+additionally needs Docker, psql, and a sibling hot checkout for
+provision_runtime.sql. The API uses a separate NOSUPERUSER NOBYPASSRLS runtime
+login; migrations use the schema owner.
 Usage: python3 integration/suborg_fixture.py --backend postgres -- <test command>
 """
 
@@ -27,6 +28,38 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+# The root's org key. It provisions children and their environments, mints
+# environment keys there, and manages the root's own org keys and usage.
+# `org:*` selects children only; the root's own resources are named by ID.
+def top_grants(root_id):
+    return {
+        "org:*": ["create", "read", "update"],
+        "org:*/env:*": ["create", "read"],
+        "org:*/env:*/api-key:*": ["create", "read", "update", "delete"],
+        "org:*/env:*/*:*": ["*"],
+        "org:*/env:*/call:*": ["delete"],
+        f"org:{root_id}": ["read"],
+        f"org:{root_id}/api-key:*": ["create", "read", "update", "delete"],
+        f"org:{root_id}/usage:*": ["read"],
+    }
+
+
+# A delegated org key, minted by the top key. Credentials it issues are later
+# revoked or narrowed through the top key.
+ISSUER_GRANTS = {
+    "org:*": ["create", "read", "update"],
+    "org:*/env:*": ["create", "read"],
+    "org:*/env:*/api-key:*": ["create", "read"],
+    "org:*/env:*/*:*": ["*"],
+}
+
+NARROWED_GRANTS = {
+    "org:*": ["read"],
+    "org:*/env:*": ["read"],
+    "org:*/env:*/event:sdk:*": ["create", "read"],
+    "org:*/env:*/stream:*": ["read"],
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -34,6 +67,12 @@ def main():
     parser.add_argument("--hot", default=shutil.which("hot"))
     parser.add_argument(
         "--hot-repo", type=Path, default=Path(__file__).resolve().parents[2] / "hot"
+    )
+    parser.add_argument(
+        "--pg-port",
+        type=int,
+        default=0,
+        help="host port for the disposable PostgreSQL container (default: any free port)",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -63,6 +102,7 @@ def main():
                 name = "hot-sdk-suborg-" + uuid.uuid4().hex[:12]
                 containers.append(name)
                 password = secrets.token_hex(16)
+                published = f"127.0.0.1:{args.pg_port or ''}:5432"
                 subprocess.run(
                     [
                         "docker",
@@ -73,14 +113,14 @@ def main():
                         "-e",
                         "POSTGRES_PASSWORD=" + password,
                         "-p",
-                        "127.0.0.1::5432",
+                        published,
                         "pgvector/pgvector:pg18",
                     ],
                     check=True,
                     stdout=subprocess.DEVNULL,
                 )
                 bound = subprocess.check_output(["docker", "port", name, "5432/tcp"], text=True)
-                pgport = bound.strip().rsplit(":", 1)[1]
+                pgport = bound.strip().splitlines()[0].rsplit(":", 1)[1]
                 admin_uri = f"postgresql://postgres:{password}@127.0.0.1:{pgport}/postgres"
 
                 def sql(statement, uri=None):
@@ -190,56 +230,37 @@ def main():
                 db.execute("UPDATE org SET org_type='organization' WHERE org_id=?", (root_bytes,))
                 db.commit()
 
-            def manager(name):
-                identity, secret = uuid.uuid4(), secrets.token_hex(16)
-                digest = hashlib.sha256(secret.encode()).digest()
-                capabilities = json.dumps(
-                    [
-                        "children:read",
-                        "children:create",
-                        "children:update",
-                        "environments:create",
-                        "runtime-keys:create",
-                        "usage:read",
-                    ]
+            def credential():
+                # Hot's API key format: hot_<uuid hex>_<64 hex>, SHA-256 of the secret.
+                identity, secret = uuid.uuid4(), secrets.token_hex(32)
+                key_data = json.dumps(
+                    {
+                        "algorithm": "sha256",
+                        "hash": base64.b64encode(hashlib.sha256(secret.encode()).digest()).decode(),
+                    }
                 )
-                if args.backend == "postgres":
-                    sql(
-                        "INSERT INTO hot.management_key (management_key_id,root_org_id,"
-                        "created_by_user_id,name,secret_hash,capabilities,all_children,"
-                        "delegation_permissions,expires_at) VALUES "
-                        f"('{identity}','{root_id}','{user_id}','{name}',"
-                        f"decode('{digest.hex()}','hex'),'{capabilities}',true,"
-                        "'{\"*:*\":[\"*\"]}',now()+interval '1 hour')"
-                    )
-                else:
-                    db.execute(
-                        "INSERT INTO management_key (management_key_id,root_org_id,"
-                        "created_by_user_id,name,secret_hash,capabilities,all_children,"
-                        "delegation_permissions,expires_at) VALUES (?,?,?,?,?,?,1,?,"
-                        "strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 hour'))",
-                        (
-                            identity.bytes,
-                            root_bytes,
-                            user_bytes,
-                            name,
-                            digest,
-                            capabilities,
-                            '{"*:*": ["*"]}',
-                        ),
-                    )
-                    db.commit()
-                return str(identity), f"hm_{identity.hex}_{secret}"
+                return identity, key_data, f"hot_{identity.hex}_{secret}"
 
-            management_id, management_token = manager("sdk-management")
-            # Root runtime key is intentionally independent of the management token.
-            key_id, secret = uuid.uuid4(), secrets.token_hex(32)
-            key_data = json.dumps(
-                {
-                    "algorithm": "sha256",
-                    "hash": base64.b64encode(hashlib.sha256(secret.encode()).digest()).decode(),
-                }
-            )
+            # The top org key is what a root administrator creates in the App.
+            org_key_id, key_data, org_token = credential()
+            grants = json.dumps(top_grants(root_id))
+            if args.backend == "postgres":
+                sql(
+                    "INSERT INTO hot.org_api_key (org_api_key_id,org_id,description,key_data,"
+                    "permissions,created_by_user_id,expires_at) VALUES "
+                    f"('{org_key_id}','{root_id}','sdk-org','{key_data}','{grants}',"
+                    f"'{user_id}',now()+interval '1 hour')"
+                )
+            else:
+                db.execute(
+                    "INSERT INTO org_api_key (org_api_key_id,org_id,description,key_data,"
+                    "permissions,created_by_user_id,expires_at) VALUES (?,?,?,?,?,?,"
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 hour'))",
+                    (org_key_id.bytes, root_bytes, "sdk-org", key_data, grants, user_bytes),
+                )
+                db.commit()
+            # Root environment key, independent of the org key.
+            key_id, key_data, root_token = credential()
             if args.backend == "postgres":
                 sql(
                     "INSERT INTO hot.api_key(api_key_id,env_id,description,key_data,"
@@ -254,10 +275,12 @@ def main():
                     (key_id.bytes, env_bytes, "sdk-root", key_data, user_bytes, '{"*:*": ["*"]}'),
                 )
                 db.commit()
-            root_token = f"hot_{key_id.hex}_{secret}"
+                db.close()
             api_env = env.copy()
             api_env["HOT_DB_URI"] = runtime_uri
             api_env["HOT_DB_RLS_ENFORCE"] = "true"
+            # `hot api` is not a local-dev profile, so context needs a master key.
+            api_env["HOT_ENCRYPTION_KEY"] = secrets.token_hex(32)
             # Redis enables real SSE ingress for the PostgreSQL fixture.
             redis_args = []
             if args.backend == "postgres":
@@ -280,7 +303,8 @@ def main():
                 bound = subprocess.check_output(
                     ["docker", "port", redis_name, "6379/tcp"], text=True
                 )
-                redis_args = ["--redis.uri", "redis://127.0.0.1:" + bound.strip().rsplit(":", 1)[1]]
+                redis_port = bound.strip().splitlines()[0].rsplit(":", 1)[1]
+                redis_args = ["--redis.uri", "redis://127.0.0.1:" + redis_port]
             with (work / "api.log").open("w") as log:
                 server = subprocess.Popen(
                     [
@@ -364,28 +388,35 @@ def main():
             print(f"Verified {len(actual)} live OpenAPI operations", flush=True)
             fixture = {
                 "root_org_id": root_id,
+                "root_env_id": env_id,
                 "root_token": root_token,
-                "management_token": management_token,
+                "org_token": org_token,
             }
-            # Prepare previously issued credentials, then revoke/narrow their manager.
-            # SDK tests verify the effective chain rather than merely presenting bad tokens.
+            # Issue credentials through a delegated org key, then revoke or
+            # narrow that key. SDK tests check the effective chain rather than
+            # merely presenting bad tokens.
             for state in ("revoked", "narrowed"):
-                issuer_id, issuer_token = manager("sdk-" + state)
+                issuer = request(
+                    "POST",
+                    f"/v1/orgs/{root_id}/api-keys",
+                    org_token,
+                    {"description": "sdk-" + state, "permissions": ISSUER_GRANTS},
+                )
                 child = request(
                     "POST",
-                    "/v1/management/children",
-                    management_token,
+                    "/v1/orgs",
+                    issuer["token"],
                     {
                         "name": state,
-                        "slug": "sdk-" + uuid.uuid4().hex,
+                        "slug": "sdk-" + uuid.uuid4().hex[:24],
                         "idempotency_key": uuid.uuid4().hex,
                     },
                 )
                 child_id, child_env = child["org"]["org_id"], child["env_id"]
                 key = request(
                     "POST",
-                    f"/v1/management/children/{child_id}/environments/{child_env}/api-keys",
-                    issuer_token,
+                    f"/v1/orgs/{child_id}/envs/{child_env}/api-keys",
+                    issuer["token"],
                     {"description": state, "permissions": {"*:*": ["*"]}},
                 )
                 service = request(
@@ -401,31 +432,15 @@ def main():
                     "POST", "/v1/sessions", key["token"], {"permissions": {"*:*": ["*"]}}
                 )
                 fixture[state] = [key["token"], service["token"], session["token"]]
-                if args.backend == "postgres":
-                    assignment = (
-                        "revoked_at=now()"
-                        if state == "revoked"
-                        else 'delegation_permissions=\'{"event:sdk:*":["create","read"],'
-                        '"stream:*":["read"]}\''
-                    )
-                    sql(
-                        f"UPDATE hot.management_key SET {assignment} "
-                        f"WHERE management_key_id='{issuer_id}'"
-                    )
+                if state == "revoked":
+                    request("DELETE", f"/v1/api-keys/{issuer['api_key_id']}", org_token)
                 else:
-                    assignment = (
-                        "revoked_at=CURRENT_TIMESTAMP"
-                        if state == "revoked"
-                        else 'delegation_permissions=\'{"event:sdk:*":["create","read"],'
-                        '"stream:*":["read"]}\''
+                    request(
+                        "PATCH",
+                        f"/v1/api-keys/{issuer['api_key_id']}",
+                        org_token,
+                        {"permissions": NARROWED_GRANTS},
                     )
-                    db.execute(
-                        f"UPDATE management_key SET {assignment} WHERE management_key_id=?",
-                        (uuid.UUID(issuer_id).bytes,),
-                    )
-                    db.commit()
-            if args.backend == "sqlite":
-                db.close()
             # Pass disposable credentials only to the test subprocess; never
             # persist them in a fixture file or upload them as an artifact.
             test_env = env.copy()

@@ -4,9 +4,12 @@
 //   - publish "sdk:task", extract its user-shaped task ID, and await the task
 //   - hot:call ::fixture::sdk/add-nums for the call/wait helper
 //   - publish "sdk:fail" to observe the run:fail error path
+// plus a retrying handler ("sdk:flaky") and a streaming function
+// (::fixture::sdk/stream-chunks) for the retry and on-chunk helpers.
 ::fixture::sdk ns
 
 ::task ::hot::task
+::stream ::hot::stream
 
 // Echoes the event payload back as the run result.
 on-sdk-echo
@@ -37,6 +40,16 @@ fn (event) {
   fail("sdk fixture failure")
 }
 
+// Fails its first attempt and succeeds on the retry, so waiters must treat
+// the first run:fail (status pending_retry) as non-terminal.
+on-sdk-flaky
+meta {on-event: "sdk:flaky", retry: {attempts: 2, delay: 500}}
+fn (event) {
+  info ::hot::run/info()
+  attempt info.run.retry-attempt
+  if(eq(attempt, 0), fail("sdk fixture first attempt"), {recovered: true, attempt: attempt})
+}
+
 // Called via the hot:call event by the call-hot/wait helpers.
 add-nums
 fn (a: Int, b: Int): Int {
@@ -53,4 +66,14 @@ fn (text: Str): Str {
 always-fail
 fn (): Str {
   fail("sdk fixture failure")
+}
+
+// Emits three stream:data chunks immediately, then returns. The server may
+// deliver these before run:start, so on-chunk helpers must buffer them.
+stream-chunks
+fn (): Str {
+  ::stream/data("chunk", {text: "a"})
+  ::stream/data("chunk", {text: "b"})
+  ::stream/data("chunk", {text: "c"})
+  "done"
 }
