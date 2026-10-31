@@ -4,7 +4,7 @@ SDK 1.3.0 wraps hot's org API (`/v1/orgs`, `/v1/api-keys` and the org-qualified
 project and build routes) on the normal client. It replaces the unreleased
 `HotManagementClient`, which targeted the `/v1/management` API and `hm_` keys
 that hot removed before 3.0.1. Matching server revision:
-`hot-dev/hot@d5dde712f447daf88c38e5546f805496c46a2877` (main, 2026-10-30).
+`hot-dev/hot@d7700112ada1f75211e3b6e66519e9388998f045` (main, 2026-10-31, with every v3.0.1 fix).
 
 Each SDK's pull request records its local validation against this pin: unit and
 contract checks, `integration/run.sh`, and this fixture on SQLite and PostgreSQL.

@@ -98,7 +98,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: hot-dev/hot
-          ref: ${{ github.event_name == 'schedule' && 'main' || 'd5dde712f447daf88c38e5546f805496c46a2877' }} # Keep aligned with integration/hot-server.ref
+          ref: ${{ github.event_name == 'schedule' && 'main' || 'd7700112ada1f75211e3b6e66519e9388998f045' }} # Keep aligned with integration/hot-server.ref
           path: .hot-server
           persist-credentials: false
 
