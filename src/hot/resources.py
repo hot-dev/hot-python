@@ -8,7 +8,7 @@ from urllib.parse import quote
 import httpx
 
 from . import _streaming
-from ._streaming import ReconnectPolicy, RunCorrelator, aiter_stream, iter_stream
+from ._streaming import ReconnectPolicy, RunCorrelator, StreamWake, aiter_stream, iter_stream
 from ._transport import AsyncTransport, SyncTransport
 from .errors import HotRunError, HotTaskError
 from .types import StreamEvent
@@ -256,9 +256,11 @@ class StreamsResource:
     ) -> dict[str, Any]:
         """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError.
 
-        A ``run:fail`` with status ``pending_retry`` is not final: the wait
-        follows the retry run, linked by ``origin_run_id``. ``timeout`` bounds
-        the whole wait; ``max_attempts`` bounds consecutive failed connections.
+        A run with status ``pending_retry`` is not final: the wait follows the
+        retry run, linked by ``origin_run_id``. A ``failed`` run whose retry
+        was scheduled is raised only if no retry run appears within 5 seconds
+        (or by ``timeout``). ``timeout`` bounds the whole wait; ``max_attempts``
+        bounds consecutive failed connections.
         """
         return wait_for_run_result(
             self._transport,
@@ -284,8 +286,10 @@ class StreamsResource:
         with ``stream:complete``. When ``reconnect=True`` (the default), the SDK
         resubscribes to the same ``stream_id`` and keeps yielding events until
         the published event's run ends: ``run:stop``, ``run:cancel``, or a
-        ``run:fail`` that is not ``pending_retry`` (a handler retry continues on
-        a new run linked by ``origin_run_id``). Replayed ``run:start`` and
+        final ``run:fail``. A run with status ``pending_retry`` is not final (a
+        handler retry continues on a new run linked by ``origin_run_id``), and
+        a ``failed`` run whose retry was scheduled ends the iterator only if no
+        retry run appears within 5 seconds. Replayed ``run:start`` and
         terminal events are deduped by ``run_id``. ``stream:data`` chunks are
         not replayed and may be lost across the reconnect window.
 
@@ -308,42 +312,52 @@ class StreamsResource:
         runs = RunCorrelator(None)
         dedupe = _RunEventDedupe()
         stream_id: str | None = None
-        while True:
-            policy.connect()
-            if stream_id is None:
-                source = self._subscribe_with_event_once(
-                    body, project=project, deadline=policy.deadline
-                )
-            else:
-                source = iter_stream(
-                    self._transport,
-                    "GET",
-                    f"/streams/{enc(stream_id)}/subscribe",
-                    params={"project": project},
-                    deadline=policy.deadline,
-                )
-            try:
-                with closing(source) as events:
-                    for event in events:
-                        policy.saw(event)
-                        published_stream, published_event = _published_ids(event)
-                        if published_stream and published_event:
-                            stream_id, runs.event_id = published_stream, published_event
-                        if dedupe.replayed(event):
-                            continue
-                        ended = runs.observe(event)
-                        yield event
-                        if ended:
-                            return
-            except Exception as error:
-                delay = policy.after_error(error, published=stream_id is not None)
-                if delay is None:
-                    raise
-            else:
+        try:
+            while True:
+                policy.connect()
                 if stream_id is None:
-                    raise RuntimeError("stream ended before event:published was received")
-                delay = policy.after_end()
-            _streaming.sleep(delay)
+                    source = self._subscribe_with_event_once(
+                        body, project=project, deadline=policy.deadline, wake=runs.wake_at
+                    )
+                else:
+                    source = iter_stream(
+                        self._transport,
+                        "GET",
+                        f"/streams/{enc(stream_id)}/subscribe",
+                        params={"project": project},
+                        deadline=policy.deadline,
+                        wake=runs.wake_at,
+                    )
+                try:
+                    with closing(source) as events:
+                        for event in events:
+                            policy.saw(event)
+                            published_stream, published_event = _published_ids(event)
+                            if published_stream and published_event:
+                                stream_id, runs.event_id = published_stream, published_event
+                            if dedupe.replayed(event):
+                                continue
+                            ended = runs.observe(event)
+                            yield event
+                            if ended:
+                                return
+                except StreamWake:
+                    # A failure held for its retry stands; its run:fail was yielded.
+                    return
+                except Exception as error:
+                    delay = policy.after_error(error, published=stream_id is not None)
+                    if delay is None:
+                        raise
+                else:
+                    if stream_id is None:
+                        raise RuntimeError("stream ended before event:published was received")
+                    delay = policy.after_end()
+                _streaming.sleep(delay)
+        except TimeoutError:
+            # A failure held for its retry stands at the deadline; its
+            # run:fail was yielded.
+            if runs.wake_at() is None:
+                raise
 
     def _subscribe_with_event_once(
         self,
@@ -351,6 +365,7 @@ class StreamsResource:
         *,
         project: str | None = None,
         deadline: float | None = None,
+        wake: _streaming.Wake | None = None,
     ) -> Iterator[StreamEvent]:
         yield from iter_stream(
             self._transport,
@@ -359,6 +374,7 @@ class StreamsResource:
             json=dict(body),
             params={"project": project},
             deadline=deadline,
+            wake=wake,
         )
 
 
@@ -958,29 +974,38 @@ def wait_for_run_result(
     """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
     policy = _run_policy(timeout, max_attempts)
     runs = RunCorrelator(event_id, on_chunk)
-    while True:
-        policy.connect()
-        try:
-            with closing(
-                iter_stream(
-                    transport,
-                    "GET",
-                    f"/streams/{enc(stream_id)}/subscribe",
-                    deadline=policy.deadline,
-                )
-            ) as events:
-                for event in events:
-                    policy.saw(event)
-                    run = runs.handle(event)
-                    if run is not None:
-                        return run
-        except Exception as error:
-            delay = policy.after_error(error)
-            if delay is None:
-                raise
-        else:
-            delay = policy.after_end()
-        _streaming.sleep(delay)
+    try:
+        while True:
+            policy.connect()
+            try:
+                with closing(
+                    iter_stream(
+                        transport,
+                        "GET",
+                        f"/streams/{enc(stream_id)}/subscribe",
+                        deadline=policy.deadline,
+                        wake=runs.wake_at,
+                    )
+                ) as events:
+                    for event in events:
+                        policy.saw(event)
+                        run = runs.handle(event)
+                        if run is not None:
+                            return run
+            except StreamWake:
+                runs.expire()
+                delay = 0.0
+            except Exception as error:
+                delay = policy.after_error(error)
+                if delay is None:
+                    raise
+            else:
+                delay = policy.after_end()
+            _streaming.sleep(delay)
+    except TimeoutError:
+        # A failure held for its retry stands at the deadline.
+        runs.expire()
+        raise
 
 
 def wait_for_call_result(
@@ -996,42 +1021,52 @@ def wait_for_call_result(
     policy = _run_policy(timeout, max_attempts)
     runs = RunCorrelator(None, on_chunk)
     stream_id: str | None = None
-    while True:
-        policy.connect()
-        if stream_id is None:
-            source = iter_stream(
-                transport,
-                "POST",
-                "/streams/subscribe-with-event",
-                json=_call_body(fn, args),
-                deadline=policy.deadline,
-            )
-        else:
-            source = iter_stream(
-                transport,
-                "GET",
-                f"/streams/{enc(stream_id)}/subscribe",
-                deadline=policy.deadline,
-            )
-        try:
-            with closing(source) as events:
-                for event in events:
-                    policy.saw(event)
-                    published_stream, published_event = _published_ids(event)
-                    if published_stream and published_event:
-                        stream_id, runs.event_id = published_stream, published_event
-                    run = runs.handle(event)
-                    if run is not None:
-                        return run
-        except Exception as error:
-            delay = policy.after_error(error, published=stream_id is not None)
-            if delay is None:
-                raise
-        else:
+    try:
+        while True:
+            policy.connect()
             if stream_id is None:
-                raise RuntimeError("stream ended before event:published was received")
-            delay = policy.after_end()
-        _streaming.sleep(delay)
+                source = iter_stream(
+                    transport,
+                    "POST",
+                    "/streams/subscribe-with-event",
+                    json=_call_body(fn, args),
+                    deadline=policy.deadline,
+                    wake=runs.wake_at,
+                )
+            else:
+                source = iter_stream(
+                    transport,
+                    "GET",
+                    f"/streams/{enc(stream_id)}/subscribe",
+                    deadline=policy.deadline,
+                    wake=runs.wake_at,
+                )
+            try:
+                with closing(source) as events:
+                    for event in events:
+                        policy.saw(event)
+                        published_stream, published_event = _published_ids(event)
+                        if published_stream and published_event:
+                            stream_id, runs.event_id = published_stream, published_event
+                        run = runs.handle(event)
+                        if run is not None:
+                            return run
+            except StreamWake:
+                runs.expire()
+                delay = 0.0
+            except Exception as error:
+                delay = policy.after_error(error, published=stream_id is not None)
+                if delay is None:
+                    raise
+            else:
+                if stream_id is None:
+                    raise RuntimeError("stream ended before event:published was received")
+                delay = policy.after_end()
+            _streaming.sleep(delay)
+    except TimeoutError:
+        # A failure held for its retry stands at the deadline.
+        runs.expire()
+        raise
 
 
 async def async_wait_for_run_result(
@@ -1046,29 +1081,38 @@ async def async_wait_for_run_result(
     """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
     policy = _run_policy(timeout, max_attempts)
     runs = RunCorrelator(event_id, on_chunk)
-    while True:
-        policy.connect()
-        try:
-            async with aclosing(
-                aiter_stream(
-                    transport,
-                    "GET",
-                    f"/streams/{enc(stream_id)}/subscribe",
-                    deadline=policy.deadline,
-                )
-            ) as events:
-                async for event in events:
-                    policy.saw(event)
-                    run = runs.handle(event)
-                    if run is not None:
-                        return run
-        except Exception as error:
-            delay = policy.after_error(error)
-            if delay is None:
-                raise
-        else:
-            delay = policy.after_end()
-        await _streaming.asleep(delay)
+    try:
+        while True:
+            policy.connect()
+            try:
+                async with aclosing(
+                    aiter_stream(
+                        transport,
+                        "GET",
+                        f"/streams/{enc(stream_id)}/subscribe",
+                        deadline=policy.deadline,
+                        wake=runs.wake_at,
+                    )
+                ) as events:
+                    async for event in events:
+                        policy.saw(event)
+                        run = runs.handle(event)
+                        if run is not None:
+                            return run
+            except StreamWake:
+                runs.expire()
+                delay = 0.0
+            except Exception as error:
+                delay = policy.after_error(error)
+                if delay is None:
+                    raise
+            else:
+                delay = policy.after_end()
+            await _streaming.asleep(delay)
+    except TimeoutError:
+        # A failure held for its retry stands at the deadline.
+        runs.expire()
+        raise
 
 
 async def async_wait_for_call_result(
@@ -1084,42 +1128,52 @@ async def async_wait_for_call_result(
     policy = _run_policy(timeout, max_attempts)
     runs = RunCorrelator(None, on_chunk)
     stream_id: str | None = None
-    while True:
-        policy.connect()
-        if stream_id is None:
-            source = aiter_stream(
-                transport,
-                "POST",
-                "/streams/subscribe-with-event",
-                json=_call_body(fn, args),
-                deadline=policy.deadline,
-            )
-        else:
-            source = aiter_stream(
-                transport,
-                "GET",
-                f"/streams/{enc(stream_id)}/subscribe",
-                deadline=policy.deadline,
-            )
-        try:
-            async with aclosing(source) as events:
-                async for event in events:
-                    policy.saw(event)
-                    published_stream, published_event = _published_ids(event)
-                    if published_stream and published_event:
-                        stream_id, runs.event_id = published_stream, published_event
-                    run = runs.handle(event)
-                    if run is not None:
-                        return run
-        except Exception as error:
-            delay = policy.after_error(error, published=stream_id is not None)
-            if delay is None:
-                raise
-        else:
+    try:
+        while True:
+            policy.connect()
             if stream_id is None:
-                raise RuntimeError("stream ended before event:published was received")
-            delay = policy.after_end()
-        await _streaming.asleep(delay)
+                source = aiter_stream(
+                    transport,
+                    "POST",
+                    "/streams/subscribe-with-event",
+                    json=_call_body(fn, args),
+                    deadline=policy.deadline,
+                    wake=runs.wake_at,
+                )
+            else:
+                source = aiter_stream(
+                    transport,
+                    "GET",
+                    f"/streams/{enc(stream_id)}/subscribe",
+                    deadline=policy.deadline,
+                    wake=runs.wake_at,
+                )
+            try:
+                async with aclosing(source) as events:
+                    async for event in events:
+                        policy.saw(event)
+                        published_stream, published_event = _published_ids(event)
+                        if published_stream and published_event:
+                            stream_id, runs.event_id = published_stream, published_event
+                        run = runs.handle(event)
+                        if run is not None:
+                            return run
+            except StreamWake:
+                runs.expire()
+                delay = 0.0
+            except Exception as error:
+                delay = policy.after_error(error, published=stream_id is not None)
+                if delay is None:
+                    raise
+            else:
+                if stream_id is None:
+                    raise RuntimeError("stream ended before event:published was received")
+                delay = policy.after_end()
+            await _streaming.asleep(delay)
+    except TimeoutError:
+        # A failure held for its retry stands at the deadline.
+        runs.expire()
+        raise
 
 
 class AsyncEventsResource:
@@ -1309,9 +1363,11 @@ class AsyncStreamsResource:
     ) -> dict[str, Any]:
         """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError.
 
-        A ``run:fail`` with status ``pending_retry`` is not final: the wait
-        follows the retry run, linked by ``origin_run_id``. ``timeout`` bounds
-        the whole wait; ``max_attempts`` bounds consecutive failed connections.
+        A run with status ``pending_retry`` is not final: the wait follows the
+        retry run, linked by ``origin_run_id``. A ``failed`` run whose retry
+        was scheduled is raised only if no retry run appears within 5 seconds
+        (or by ``timeout``). ``timeout`` bounds the whole wait; ``max_attempts``
+        bounds consecutive failed connections.
         """
         return await async_wait_for_run_result(
             self._transport,
@@ -1344,42 +1400,52 @@ class AsyncStreamsResource:
         runs = RunCorrelator(None)
         dedupe = _RunEventDedupe()
         stream_id: str | None = None
-        while True:
-            policy.connect()
-            if stream_id is None:
-                source = self._subscribe_with_event_once(
-                    body, project=project, deadline=policy.deadline
-                )
-            else:
-                source = aiter_stream(
-                    self._transport,
-                    "GET",
-                    f"/streams/{enc(stream_id)}/subscribe",
-                    params={"project": project},
-                    deadline=policy.deadline,
-                )
-            try:
-                async with aclosing(source) as events:
-                    async for event in events:
-                        policy.saw(event)
-                        published_stream, published_event = _published_ids(event)
-                        if published_stream and published_event:
-                            stream_id, runs.event_id = published_stream, published_event
-                        if dedupe.replayed(event):
-                            continue
-                        ended = runs.observe(event)
-                        yield event
-                        if ended:
-                            return
-            except Exception as error:
-                delay = policy.after_error(error, published=stream_id is not None)
-                if delay is None:
-                    raise
-            else:
+        try:
+            while True:
+                policy.connect()
                 if stream_id is None:
-                    raise RuntimeError("stream ended before event:published was received")
-                delay = policy.after_end()
-            await _streaming.asleep(delay)
+                    source = self._subscribe_with_event_once(
+                        body, project=project, deadline=policy.deadline, wake=runs.wake_at
+                    )
+                else:
+                    source = aiter_stream(
+                        self._transport,
+                        "GET",
+                        f"/streams/{enc(stream_id)}/subscribe",
+                        params={"project": project},
+                        deadline=policy.deadline,
+                        wake=runs.wake_at,
+                    )
+                try:
+                    async with aclosing(source) as events:
+                        async for event in events:
+                            policy.saw(event)
+                            published_stream, published_event = _published_ids(event)
+                            if published_stream and published_event:
+                                stream_id, runs.event_id = published_stream, published_event
+                            if dedupe.replayed(event):
+                                continue
+                            ended = runs.observe(event)
+                            yield event
+                            if ended:
+                                return
+                except StreamWake:
+                    # A failure held for its retry stands; its run:fail was yielded.
+                    return
+                except Exception as error:
+                    delay = policy.after_error(error, published=stream_id is not None)
+                    if delay is None:
+                        raise
+                else:
+                    if stream_id is None:
+                        raise RuntimeError("stream ended before event:published was received")
+                    delay = policy.after_end()
+                await _streaming.asleep(delay)
+        except TimeoutError:
+            # A failure held for its retry stands at the deadline; its
+            # run:fail was yielded.
+            if runs.wake_at() is None:
+                raise
 
     async def _subscribe_with_event_once(
         self,
@@ -1387,6 +1453,7 @@ class AsyncStreamsResource:
         *,
         project: str | None = None,
         deadline: float | None = None,
+        wake: _streaming.Wake | None = None,
     ) -> AsyncIterator[StreamEvent]:
         async for event in aiter_stream(
             self._transport,
@@ -1395,6 +1462,7 @@ class AsyncStreamsResource:
             json=dict(body),
             params={"project": project},
             deadline=deadline,
+            wake=wake,
         ):
             yield event
 

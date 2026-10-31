@@ -102,8 +102,13 @@ and `streams.subscribe_with_event` share one reconnect policy:
   closes every subscription 5 minutes after it opens, with `stream:complete`;
   those rollovers reconnect at once and do not count, so long runs can be
   awaited for as long as `timeout` allows.
-- A run that fails with status `pending_retry` is not final: the waiter
-  follows the handler's retry run (linked by `origin_run_id`).
+- A run with status `pending_retry` is not final, whatever the event: the
+  waiter follows the handler's retry run (linked by `origin_run_id`). Hot can
+  replay a retried attempt as `run:fail` with status `failed` before the retry
+  run exists; when its `retry_attempt` shows a scheduled retry, the waiter
+  holds that failure for 5 seconds (or until `timeout`) and raises it only if
+  no retry run appears. `subscribe_with_event` yields that `run:fail` and ends
+  after the same grace.
 - `on_chunk` receives `stream:data` text in order, including chunks the server
   delivers before `run:start`.
 

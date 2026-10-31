@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
 
-from hot import AsyncHotClient, HotClient
+from hot import AsyncHotClient, HotClient, _streaming
 
 PUBLISHED = {"type": "event:published", "stream_id": "s1", "event_id": "e1"}
 
@@ -170,3 +171,113 @@ def test_cancelled_run_raises():
     with hot:
         with pytest.raises(RuntimeError, match="Run cancelled"):
             hot.events.call_hot("::f/g")
+
+
+# hot replays a retried first attempt lossily (hot 3.0.0 and d5dde71): before
+# the retry is queued as run:stop with status pending_retry, and after it is
+# queued (before the retry run exists) as run:fail with status failed and a
+# raised retry_attempt.
+RETRY_RUN = run("run:stop", "r2", "succeeded", event_id="e9", origin_run_id="r1", result="ok")
+
+
+def held_failure(**fields) -> dict:
+    return run("run:fail", "r1", "failed", retry_attempt=1, result="first attempt", **fields)
+
+
+@pytest.mark.parametrize(
+    "replay",
+    [
+        run("run:fail", "r1", "pending_retry", retry_attempt=1),
+        run("run:stop", "r1", "pending_retry", retry_attempt=1),
+        held_failure(),
+    ],
+    ids=["fail-pending-retry", "stop-pending-retry", "fail-failed-retried"],
+)
+def test_lossy_retry_replays_follow_the_retry_run(replay):
+    hot, ahot = serve(sse(PUBLISHED, replay, RETRY_RUN), sse(PUBLISHED, replay, RETRY_RUN))
+    with hot:
+        assert hot.events.call_hot("::f/g") == "ok"
+
+    async def scenario():
+        async with ahot:
+            return await ahot.streams.wait_for_run_result("s1", "e1")
+
+    assert asyncio.run(scenario())["run_id"] == "r2"
+
+
+def test_retry_run_seen_before_its_origin():
+    hot, _ = serve(sse(PUBLISHED, RETRY_RUN, held_failure()))
+    with hot:
+        assert hot.streams.wait_for_run_result("s1", "e1")["run_id"] == "r2"
+
+
+def test_retried_run_failure_after_its_retry_appeared_is_not_final():
+    start = run("run:start", "r2", "running", event_id="e9", origin_run_id="r1")
+    hot, _ = serve(
+        sse(PUBLISHED, run("run:fail", "r1", "pending_retry"), start, held_failure(), RETRY_RUN)
+    )
+    with hot:
+        assert hot.events.call_hot("::f/g") == "ok"
+
+
+def slow_stream(*events: dict, then: float):
+    """A stream that sends ``events``, then keepalives every ``then`` seconds."""
+
+    def body():
+        yield sse(*events)
+        while True:
+            time.sleep(then)
+            yield b": keepalive\n\n"
+
+    return body()
+
+
+def test_held_failure_stands_when_no_retry_appears(monkeypatch):
+    monkeypatch.setattr(_streaming, "RETRY_GRACE", 0.2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=slow_stream(PUBLISHED, held_failure(), then=0.3),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    with HotClient(
+        token="t",
+        base_url="https://api.example.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ) as hot:
+        with pytest.raises(RuntimeError, match="first attempt"):
+            hot.events.call_hot("::f/g", timeout=30)
+
+
+def test_failures_without_a_scheduled_retry_are_reported_at_once():
+    # No retries configured: retry_attempt stays 0.
+    hot, _ = serve(sse(PUBLISHED, run("run:fail", "r1", "failed", retry_attempt=0, result="no")))
+    started = time.monotonic()
+    with hot:
+        with pytest.raises(RuntimeError, match="no"):
+            hot.events.call_hot("::f/g")
+    assert time.monotonic() - started < 1
+
+    # The last retry fails: its attempt number is its origin's.
+    hot, _ = serve(
+        sse(
+            PUBLISHED,
+            run("run:fail", "r1", "pending_retry", retry_attempt=1),
+            run(
+                "run:fail",
+                "r2",
+                "failed",
+                event_id="e9",
+                origin_run_id="r1",
+                retry_attempt=1,
+                result="last",
+            ),
+        )
+    )
+    started = time.monotonic()
+    with hot:
+        with pytest.raises(RuntimeError, match="last"):
+            hot.streams.wait_for_run_result("s1", "e1")
+    assert time.monotonic() - started < 1

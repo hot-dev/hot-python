@@ -28,9 +28,12 @@ class SseServer:
     ``"silent"`` (headers, then nothing) or ``"no-headers"`` (accept, never reply).
     """
 
-    def __init__(self, mode: str = "keepalive", interval: float = 0.2) -> None:
+    def __init__(
+        self, mode: str = "keepalive", interval: float = 0.2, events: tuple[dict, ...] = ()
+    ) -> None:
         self.mode = mode
         self.interval = interval
+        self.events = events
         self.connections = 0
         self._closing = threading.Event()
         server = self
@@ -51,9 +54,10 @@ class SseServer:
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 try:
-                    if self.command == "POST":
-                        self.wfile.write(f"data: {json.dumps(PUBLISHED)}\n\n".encode())
-                        self.wfile.flush()
+                    first = ((PUBLISHED,) if self.command == "POST" else ()) + server.events
+                    for event in first:
+                        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    self.wfile.flush()
                     while not server._closing.wait(server.interval):
                         if server.mode == "keepalive":
                             self.wfile.write(b": keepalive\n\n")
@@ -170,3 +174,55 @@ def test_dead_socket_is_a_transient_error(monkeypatch):
             with pytest.raises(httpx.ReadTimeout):
                 hot.streams.wait_for_run_result("s1", "e1", timeout=30, max_attempts=2)
         assert server.connections == 3
+
+
+# hot replays a first attempt whose retry is queued as run:fail with status
+# failed; the waiter holds it for RETRY_GRACE and reports it if no retry run
+# appears, even while keepalives keep the stream open.
+HELD_FAILURE = (
+    {
+        "type": "run:fail",
+        "run": {
+            "run_id": "r1",
+            "event_id": "e1",
+            "status": "failed",
+            "retry_attempt": 1,
+            "result": "first attempt",
+        },
+    },
+)
+
+
+def test_held_failure_is_reported_after_the_grace(monkeypatch):
+    monkeypatch.setattr(_streaming, "RETRY_GRACE", 1.0)
+    with SseServer("keepalive", interval=5.0, events=HELD_FAILURE) as server:
+        with HotClient(token="t", base_url=server.base_url) as hot:
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="first attempt"):
+                hot.events.call_hot("::f/g", timeout=30)
+            elapsed = time.monotonic() - started
+            sub_started = time.monotonic()
+            events = list(hot.streams.subscribe_with_event({"event_type": "x"}, timeout=30))
+            sub_elapsed = time.monotonic() - sub_started
+
+        async def scenario():
+            async with AsyncHotClient(token="t", base_url=server.base_url) as hot:
+                await hot.streams.wait_for_run_result("s1", "e1", timeout=30)
+
+        async_started = time.monotonic()
+        with pytest.raises(RuntimeError, match="first attempt"):
+            asyncio.run(scenario())
+        async_elapsed = time.monotonic() - async_started
+    assert 0.9 < elapsed < 2.0
+    assert [event["type"] for event in events] == ["event:published", "run:fail"]
+    assert 0.9 < sub_elapsed < 2.0
+    assert 0.9 < async_elapsed < 2.0
+
+
+def test_held_failure_is_reported_at_an_earlier_deadline():
+    with SseServer("keepalive", interval=5.0, events=HELD_FAILURE) as server:
+        with HotClient(token="t", base_url=server.base_url) as hot:
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="first attempt"):
+                hot.streams.wait_for_run_result("s1", "e1", timeout=1.0)
+    assert time.monotonic() - started < 2.0
