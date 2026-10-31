@@ -1,73 +1,51 @@
-# Sub-org SDK validation
+# Org API SDK validation
 
-Validated locally on 2026-10-20 for the coordinated SDK 1.3.0 changes on
-`codex/sub-org-management-sdk`. Matching public server revision:
-`hot-dev/hot@d5dde712f447daf88c38e5546f805496c46a2877`.
+SDK 1.3.0 wraps hot's org API (`/v1/orgs`, `/v1/api-keys` and the org-qualified
+project and build routes) on the normal client. It replaces the unreleased
+`HotManagementClient`, which targeted the `/v1/management` API and `hm_` keys
+that hot removed before 3.0.1. Matching server revision:
+`hot-dev/hot@d5dde712f447daf88c38e5546f805496c46a2877` (main, 2026-10-30).
 
-| SDK | Unit/contract checks | Existing runtime integration | Sub-org SQLite | Sub-org PostgreSQL |
-| --- | --- | --- | --- | --- |
-| JavaScript/TypeScript | 38 passed; typecheck and package build passed | 5 passed | 2 passed | 2 passed |
-| Python | 31 passed; Ruff and wheel/sdist build passed | 6 passed | 3 passed | 3 passed |
-| Go | 32 top-level tests plus 10 subtests passed; vet and race checks passed | 5 passed | 2 passed | 2 passed |
-| Rust | 30 passed including doctest; fmt, strict Clippy and docs passed | 5 passed | 2 passed | 2 passed |
-| Java | 29 passed; build and Javadocs passed | 5 passed | 2 passed | 2 passed |
+Each SDK's pull request records its local validation against this pin: unit and
+contract checks, `integration/run.sh`, and this fixture on SQLite and PostgreSQL.
+Every fixture run compares the SDK's coverage fixture with all **83 live
+OpenAPI operations** of the pinned server.
 
-Ordinary unit runs skip the live-server tests; the integration results above
-come from separate explicit runs. Each final sub-org fixture run compared the
-SDK's coverage fixture against all **68 live OpenAPI operations**.
+## The fixture
 
-The PostgreSQL 18 fixture ran migrations with a non-superuser schema owner,
-then provisioned and qualified a separate non-owner `NOSUPERUSER NOBYPASSRLS`
-API login. Runtime RLS enforcement stayed enabled. Fixture setup alone used
-its disposable database administrator to seed test credentials. Each fixture
-owns and removes its temporary database, API process, and containers.
+`integration/suborg_fixture.py` is identical in all five SDK repos (canonical
+copy: hot-python). It runs `hot init` on a disposable SQLite file or a
+PostgreSQL 18 container, then:
 
-Sub-org coverage: retry-safe child/environment provisioning; same project names
-in sibling environments; parent/sibling resource and stream denial; management
-versus runtime token separation; environment usage versus shared limits; scoped
-API-key grants; service/session issuance and revocation; already issued API,
-service, and session credentials after issuer revocation/narrowing; and child
-suspension/resumption without affecting a sibling. Python also exercises its
-async clients; Java exercises its asynchronous management wrapper.
+- seeds a top org API key (`org_api_key`, as a root administrator would create
+  in the App) and an independent root environment key;
+- starts `hot api` with a random master key (`HOT_ENCRYPTION_KEY`) and, for
+  PostgreSQL, a Valkey container for SSE ingress;
+- checks the live `/openapi.json` against the SDK's operations fixture;
+- mints a delegated org key through `POST /v1/orgs/{root}/api-keys`, uses it to
+  create a child org and an environment key, issues a service key and a
+  session from that key, then revokes or narrows the delegated key.
 
-The shared fixture is canonical in hot-python and identical in all five repos.
-Use the commands in each SDK README to reproduce against the matching Hot build.
-Native checks used macOS arm64, Node 26.12.0, Python 3.14, Go 1.27.3,
-Rust 1.99.1, and JDK 21.0.12.1. Linux and minimum-toolchain checks remain in CI.
+The SDK tests receive `HOT_TEST_SUBORG_FIXTURE` (`root_org_id`, `root_env_id`,
+`root_token`, `org_token`, `revoked`, `narrowed`) and check: child and
+environment provisioning and its retry safety, environment-key minting,
+org-scoped projects and context, sibling isolation, `key_scope_mismatch`
+in both directions as the typed error, and that credentials issued under a
+revoked or narrowed org key stop or narrow on their next request.
 
-No hierarchy changes or shared deployments are included. The server contract
-remains a root with direct children, each owning its environments/deployments.
+PostgreSQL runs migrations with a non-superuser schema owner and serves the
+API with a separate `NOSUPERUSER NOBYPASSRLS` login, with RLS enforced.
+`--pg-port` picks the container's host port. The fixture removes its
+database, API process and containers on exit, and passes the disposable
+credentials only to the test subprocess.
 
-## PostgreSQL isolation in CI
+## CI
 
-The `PostgreSQL Sub-org Isolation` job in `.github/workflows/ci.yml` runs on
-pull requests and main-branch pushes. It builds the server revision pinned in
-`integration/hot-server.ref`, then invokes the same restricted-role PostgreSQL
-fixture used locally. The job checks all live OpenAPI operations and runs the
-SDK's sub-org tests explicitly, so their usual unit-test skips cannot hide a
-failure. It uses only disposable local credentials and does not deploy Hot.
-
-When the API contract changes, update the full server commit in
-`integration/hot-server.ref` and the matching immutable checkout SHA in CI,
-refresh the OpenAPI fixture, and rerun isolation
-before committing. Keep this pin aligned across all five SDK repos. The legacy
-runtime integration job remains a check against the released Hot CLI.
-
-Validation of this CI addition on 2026-10-20: Actionlint (including ShellCheck)
-passed for all five workflows. Each job's final test command also passed
-locally against the restricted-role PostgreSQL fixture: JavaScript 2 tests,
-Python 3, Go 2, Rust 2, and Java 2, with all 68 live OpenAPI operations checked
-on every run. The five shared management examples in Hot's SDK guide compiled
-and ran against that fixture as well. These were native macOS runs; hosted
-GitHub Actions and Linux source builds had not yet run at initial validation.
-The draft PR checks provide the hosted validation.
-
-CI security review: third-party Actions and the server checkout use immutable
-commit SHAs. The job verifies the checked-out server against `hot-server.ref`;
-no step output selects executable server code. Disposable test credentials are
-passed as JSON in `HOT_TEST_SUBORG_FIXTURE` to the test subprocess, rather than
-written to disk. These changes preserve the restricted runtime-role assertions.
-
-After the security fixes, the exact PostgreSQL CI commands passed again in all
-five SDKs (11 tests total), as did the JavaScript/Python/Go/Rust unit checks and
-workflow linting. Java recompiled and ran its changed integration tests.
+The `Org API isolation (PostgreSQL)` job builds the server revision pinned in
+`integration/hot-server.ref` and runs the fixture on pull requests and pushes
+to main. A weekly scheduled run builds hot `main` instead, to catch API drift
+early. When the API changes, update `integration/hot-server.ref` and the CI
+checkout SHA together, regenerate the OpenAPI fixture, and rerun the fixture.
+Keep the pin aligned across all five SDK repos. After hot v3.0.1 is tagged,
+pin to the tag's commit. The `Integration (hot dev)` job still tests the
+runtime API against the released Hot CLI.
