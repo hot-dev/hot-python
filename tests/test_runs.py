@@ -58,9 +58,7 @@ def test_run_wait_raises_structured_failure():
         token="token",
         base_url="https://api.example.test",
         client=httpx.Client(
-            transport=httpx.MockTransport(
-                lambda request: run_response("failed", {"error": "boom"})
-            )
+            transport=httpx.MockTransport(lambda request: run_response("failed", {"error": "boom"}))
         ),
     ) as hot:
         with pytest.raises(HotRunError, match="boom") as error:
@@ -74,9 +72,7 @@ def test_async_run_wait_returns_succeeded_snapshot():
             token="token",
             base_url="https://api.example.test",
             client=httpx.AsyncClient(
-                transport=httpx.MockTransport(
-                    lambda request: run_response("succeeded", "done")
-                )
+                transport=httpx.MockTransport(lambda request: run_response("succeeded", "done"))
             ),
         ) as hot:
             return await hot.runs.wait("r1")

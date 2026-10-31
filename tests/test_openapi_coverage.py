@@ -4,21 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from hot import HotClient, HotManagementClient
+from hot import HotClient
 
 OPERATIONS_PATH = Path(__file__).with_name("openapi_operations.json")
 
 COVERAGE: dict[str, dict[str, str | bool]] = {
-    "GET /v1/management/children": {"sdk": "management.list_children"},
-    "POST /v1/management/children": {"sdk": "management.create_child"},
-    "PATCH /v1/management/children/{child_id}/state": {"sdk": "management.set_child_state"},
-    "POST /v1/management/children/{child_id}/environments": {
-        "sdk": "management.create_environment"
-    },
-    "POST /v1/management/children/{child_id}/environments/{env_id}/api-keys": {
-        "sdk": "management.create_api_key"
-    },
-    "GET /v1/management/usage": {"sdk": "management.usage"},
     "GET /status": {
         "ignored": True,
         "reason": "Public health endpoint, not part of authenticated SDK resources.",
@@ -90,6 +80,30 @@ COVERAGE: dict[str, dict[str, str | bool]] = {
     "PUT /v1/files/uploads/{upload_id}/{part_number}": {"sdk": "files.upload_part"},
     "POST /v1/files/uploads/{upload_id}/complete": {"sdk": "files.complete_upload"},
     "DELETE /v1/files/uploads/{upload_id}": {"sdk": "files.abort_upload"},
+    "DELETE /v1/env/calls": {"sdk": "env.purge_calls"},
+    "DELETE /v1/runs/{run_id}/calls": {"sdk": "runs.purge_calls"},
+    "DELETE /v1/streams/{stream_id}/calls": {"sdk": "streams.purge_calls"},
+    # Org API: org API keys only.
+    "GET /v1/orgs": {"sdk": "orgs.list"},
+    "POST /v1/orgs": {"sdk": "orgs.create"},
+    "GET /v1/orgs/{org_id}": {"sdk": "orgs.get"},
+    "PATCH /v1/orgs/{org_id}": {"sdk": "orgs.update"},
+    "GET /v1/orgs/{org_id}/usage": {"sdk": "orgs.usage"},
+    "DELETE /v1/orgs/{org_id}/calls": {"sdk": "orgs.purge_calls"},
+    "GET /v1/orgs/{org_id}/envs": {"sdk": "orgs.list_envs"},
+    "POST /v1/orgs/{org_id}/envs": {"sdk": "orgs.create_env"},
+    "GET /v1/orgs/{org_id}/envs/{env_id}": {"sdk": "orgs.get_env"},
+    "GET /v1/orgs/{org_id}/api-keys": {"sdk": "orgs.list_api_keys"},
+    "POST /v1/orgs/{org_id}/api-keys": {"sdk": "orgs.create_api_key"},
+    "GET /v1/orgs/{org_id}/envs/{env_id}/api-keys": {"sdk": "orgs.list_env_api_keys"},
+    "POST /v1/orgs/{org_id}/envs/{env_id}/api-keys": {"sdk": "orgs.create_env_api_key"},
+    # The OpenAPI spec lists only this one of the forwarded project, build and
+    # context routes; orgs.env(...) exposes all of them.
+    "GET /v1/orgs/{org_id}/envs/{env_id}/projects": {"sdk": "orgs.env().projects.list"},
+    "GET /v1/api-keys/{key_id}": {"sdk": "api_keys.get"},
+    "PATCH /v1/api-keys/{key_id}": {"sdk": "api_keys.update"},
+    "DELETE /v1/api-keys/{key_id}": {"sdk": "api_keys.revoke"},
+    "POST /v1/api-keys/{key_id}/rotate": {"sdk": "api_keys.rotate"},
 }
 
 
@@ -118,9 +132,9 @@ def operation_key(operation: dict[str, Any]) -> str:
 
 def resolve_sdk_method(client: HotClient, path: str) -> Any:
     value: Any = client
-    if path.startswith("management."):
-        with HotManagementClient(token="hm_test") as management:
-            return getattr(management, path.split(".", 1)[1])
     for part in path.split("."):
-        value = getattr(value, part)
+        if part.endswith("()"):
+            value = getattr(value, part[:-2])("org_123", "env_123")
+        else:
+            value = getattr(value, part)
     return value
