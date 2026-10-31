@@ -5,6 +5,10 @@ on:
   push:
     branches:
       - main
+  # Weekly: run the org API isolation job against hot main, so drift in the
+  # API or its OpenAPI operations shows up before the pin is moved.
+  schedule:
+    - cron: "23 6 * * 1"
 
 permissions:
   contents: read
@@ -21,6 +25,8 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
+          - "3.15"
 
     steps:
       - name: Checkout
@@ -30,13 +36,16 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
           cache: pip
 
       - name: Install
         run: python -m pip install -e ".[dev]"
 
       - name: Lint
-        run: ruff check .
+        run: |
+          ruff check .
+          ruff format --check src tests
 
       - name: Test
         run: pytest
@@ -68,7 +77,7 @@ jobs:
         run: ./integration/run.sh
 
   postgres-isolation:
-    name: PostgreSQL Sub-org Isolation
+    name: Org API isolation (PostgreSQL)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -84,15 +93,17 @@ jobs:
 
       # A released CLI may lag these API changes. Pin the tested server source
       # separately so its schema, runtime qualification, and OpenAPI agree.
+      # The weekly scheduled run builds hot main instead, to catch drift.
       - name: Checkout matching Hot server
         uses: actions/checkout@v5
         with:
           repository: hot-dev/hot
-          ref: d5dde712f447daf88c38e5546f805496c46a2877 # Keep aligned with integration/hot-server.ref
+          ref: ${{ github.event_name == 'schedule' && 'main' || 'd5dde712f447daf88c38e5546f805496c46a2877' }} # Keep aligned with integration/hot-server.ref
           path: .hot-server
           persist-credentials: false
 
       - name: Verify matching Hot revision
+        if: github.event_name != 'schedule'
         shell: bash
         run: |
           expected="$(cat integration/hot-server.ref)"
@@ -122,7 +133,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: .hot-server -> target
-          key: postgres-isolation-${{ hashFiles('integration/hot-server.ref') }}
+          key: postgres-isolation-${{ github.event_name == 'schedule' && 'main' || hashFiles('integration/hot-server.ref') }}
           cache-workspace-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -143,7 +154,7 @@ jobs:
       - name: Install Python SDK dependencies
         run: python -m pip install -e ".[dev]"
 
-      - name: Test PostgreSQL isolation with restricted runtime credentials
+      - name: Test org API isolation with restricted runtime credentials
         run: |
           python3 integration/suborg_fixture.py \
             --backend postgres \
