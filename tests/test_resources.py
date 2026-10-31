@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
-from hot import HotClient
+from hot import AsyncHotClient, HotClient
 
 
 def test_core_resource_methods_route_to_expected_api_paths():
@@ -91,4 +93,61 @@ def test_core_resource_methods_route_to_expected_api_paths():
         ("POST", "/v1/files/uploads/upload_123/complete"),
         ("DELETE", "/v1/files/uploads/upload_123"),
         ("GET", "/v1/org/usage"),
+    ]
+
+
+def test_blobs_download_returns_the_raw_bytes():
+    seen: list[tuple[str, str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.url.raw_path.decode()))
+        return httpx.Response(
+            200,
+            content=b"\x00\x01blob",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    with HotClient(
+        token="test-token",
+        base_url="https://api.example.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ) as hot:
+        assert hot.blobs.download("blob_123").content == b"\x00\x01blob"
+        with hot.blobs.download_stream("blob/123") as response:
+            assert b"".join(response.iter_bytes()) == b"\x00\x01blob"
+
+    assert seen == [
+        ("GET", "/v1/blobs/blob_123/download", "/v1/blobs/blob_123/download"),
+        ("GET", "/v1/blobs/blob/123/download", "/v1/blobs/blob%2F123/download"),
+    ]
+
+
+def test_async_blobs_download_returns_the_raw_bytes():
+    seen: list[tuple[str, str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.url.raw_path.decode()))
+        return httpx.Response(
+            200,
+            content=b"\x00\x01blob",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    async def scenario() -> None:
+        async with AsyncHotClient(
+            token="test-token",
+            base_url="https://api.example.test",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        ) as hot:
+            assert (await hot.blobs.download("blob_123")).content == b"\x00\x01blob"
+            async with hot.blobs.download_stream("blob/123") as response:
+                assert b"".join([chunk async for chunk in response.aiter_bytes()]) == (
+                    b"\x00\x01blob"
+                )
+
+    asyncio.run(scenario())
+
+    assert seen == [
+        ("GET", "/v1/blobs/blob_123/download", "/v1/blobs/blob_123/download"),
+        ("GET", "/v1/blobs/blob/123/download", "/v1/blobs/blob%2F123/download"),
     ]

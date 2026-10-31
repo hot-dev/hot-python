@@ -8,7 +8,7 @@ that hot removed before 3.0.1. Matching server revision:
 
 Each SDK's pull request records its local validation against this pin: unit and
 contract checks, `integration/run.sh`, and this fixture on SQLite and PostgreSQL.
-Every fixture run compares the SDK's coverage fixture with all **83 live
+Every fixture run compares the SDK's coverage fixture with all **85 live
 OpenAPI operations** of the pinned server.
 
 ## The fixture

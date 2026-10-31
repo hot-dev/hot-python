@@ -9,6 +9,7 @@ from ._transport import AsyncTransport, SyncTransport
 from .resources import (
     ApiKeysResource,
     AsyncApiKeysResource,
+    AsyncBlobsResource,
     AsyncBuildsResource,
     AsyncContextResource,
     AsyncDomainsResource,
@@ -23,6 +24,7 @@ from .resources import (
     AsyncSessionsResource,
     AsyncStreamsResource,
     AsyncTasksResource,
+    BlobsResource,
     BuildsResource,
     ContextResource,
     DomainsResource,
@@ -65,6 +67,7 @@ class HotClient:
             client=client,
         )
         self.api_keys = ApiKeysResource(self._transport)
+        self.blobs = BlobsResource(self._transport)
         self.builds = BuildsResource(self._transport)
         self.context = ContextResource(self._transport)
         self.domains = DomainsResource(self._transport)
@@ -136,6 +139,7 @@ class AsyncHotClient:
             client=client,
         )
         self.api_keys = AsyncApiKeysResource(self._transport)
+        self.blobs = AsyncBlobsResource(self._transport)
         self.builds = AsyncBuildsResource(self._transport)
         self.context = AsyncContextResource(self._transport)
         self.domains = AsyncDomainsResource(self._transport)

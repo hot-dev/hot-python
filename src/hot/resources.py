@@ -510,6 +510,31 @@ class FilesResource:
         self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
 
 
+class BlobsResource:
+    def __init__(self, transport: SyncTransport) -> None:
+        self._transport = transport
+
+    def download(self, blob_ref_id: str) -> httpx.Response:
+        """Return the HTTP response with the whole blob read into memory.
+
+        A large payload spilled to blob storage, in the caller's environment.
+        Needs an environment API key; string payloads are served as UTF-8
+        text. Use :meth:`download_stream` for large blobs.
+        """
+        return self._transport.request_raw("GET", f"/blobs/{enc(blob_ref_id)}/download")
+
+    @contextmanager
+    def download_stream(self, blob_ref_id: str) -> Iterator[httpx.Response]:
+        """Stream the blob content without buffering it.
+
+        ``with hot.blobs.download_stream(blob_ref_id) as response:`` then
+        iterate ``response.iter_bytes()``. The connection closes when the block
+        exits.
+        """
+        with self._transport.stream_raw("GET", f"/blobs/{enc(blob_ref_id)}/download") as response:
+            yield response
+
+
 class ProjectsResource:
     def __init__(self, transport: SyncTransport, prefix: str = "") -> None:
         self._transport = transport
@@ -1603,6 +1628,32 @@ class AsyncFilesResource:
     async def abort_upload(self, upload_id: str) -> None:
         """Cancel a multipart upload."""
         await self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
+
+
+class AsyncBlobsResource:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._transport = transport
+
+    async def download(self, blob_ref_id: str) -> httpx.Response:
+        """Return the HTTP response with the whole blob read into memory.
+
+        A large payload spilled to blob storage, in the caller's environment.
+        Needs an environment API key; string payloads are served as UTF-8
+        text. Use :meth:`download_stream` for large blobs.
+        """
+        return await self._transport.request_raw("GET", f"/blobs/{enc(blob_ref_id)}/download")
+
+    @asynccontextmanager
+    async def download_stream(self, blob_ref_id: str) -> AsyncIterator[httpx.Response]:
+        """Stream the blob content without buffering it.
+
+        ``async with hot.blobs.download_stream(blob_ref_id) as response:`` then
+        iterate ``response.aiter_bytes()``.
+        """
+        async with self._transport.stream_raw(
+            "GET", f"/blobs/{enc(blob_ref_id)}/download"
+        ) as response:
+            yield response
 
 
 class AsyncProjectsResource:
