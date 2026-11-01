@@ -187,7 +187,7 @@ retried; waiters follow the reconnect policy above.
 - `hot.service_keys` — create and revoke scoped service keys
 - `hot.org` — view the environment's usage and limits
 - `hot.env` — read environment info, subscribe to environment events, and purge call traces
-- `hot.orgs` — with an org API key: child organizations, their environments and API keys, account usage, and `orgs.env(org_id, env_id)` for projects, builds and context in an environment
+- `hot.orgs` — with an org API key: sub-organizations, their environments and API keys, account usage, and `orgs.env(org_id, env_id)` for projects, builds and context in an environment
 - `hot.api_keys` — with an org API key: get, narrow, rotate, and revoke API keys it issued
 
 Use `hot.request(...)` or `hot.request_raw(...)` as an escape hatch for API
@@ -256,8 +256,8 @@ future release.
 
 ## Org API
 
-Requires Hot 3.0.1 or later. An org API key (created by a root admin in the
-App) provisions child organizations, their environments, and environment API
+Requires Hot 3.0.1 or later. An org API key (created by an administrator of the parent organization in the
+App) provisions sub-organizations, their environments, and environment API
 keys. Org keys only call `hot.orgs` and `hot.api_keys`; environment keys,
 service keys, and sessions only call runtime resources. Either kind of key on
 the wrong routes raises `HotKeyScopeError`.
@@ -270,7 +270,7 @@ from hot import HotClient
 
 with HotClient(token=os.environ["HOT_ORG_API_KEY"]) as org:
     request_id = uuid.uuid4().hex[:24]
-    child = org.orgs.create(
+    sub_org = org.orgs.create(
         {
             "name": "Customer",
             "slug": f"customer-{request_id}",  # 32 characters or fewer
@@ -278,13 +278,13 @@ with HotClient(token=os.environ["HOT_ORG_API_KEY"]) as org:
             "idempotency_key": request_id,  # reuse it when retrying this request
         }
     )
-    org_id, env_id = child["org"]["org_id"], child["env_id"]
+    org_id, env_id = sub_org["org"]["org_id"], sub_org["env_id"]
     key = org.orgs.create_env_api_key(
         org_id,
         env_id,
         {"description": "Customer backend", "permissions": {"*:*": ["*"]}},
     )
-    # Projects, builds and context in the child's environment, with the org key.
+    # Projects, builds and context in the sub-organization's environment, with the org key.
     org.orgs.env(org_id, env_id).projects.create({"name": "agent"})
 
 with HotClient(token=key["token"]) as customer:
@@ -296,7 +296,7 @@ with HotClient(token=key["token"]) as customer:
 | `orgs.list(limit=, offset=)` | `GET /v1/orgs` (list envelope) |
 | `orgs.create(body)` | `POST /v1/orgs`: returns `org`, `env_id`, `created` |
 | `orgs.get(org_id)` / `orgs.update(org_id, {"state": ...})` | `GET`/`PATCH /v1/orgs/{org_id}` (`active`, `suspended`, `archived`) |
-| `orgs.usage(root_org_id)` | `GET /v1/orgs/{org_id}/usage` (account usage; root org only) |
+| `orgs.usage(parent_org_id)` | `GET /v1/orgs/{org_id}/usage` (account usage; parent organization only) |
 | `orgs.purge_calls(org_id, include_sub_orgs=False)` | `DELETE /v1/orgs/{org_id}/calls` |
 | `orgs.list_envs` / `create_env` / `get_env` | `/v1/orgs/{org_id}/envs[/{env_id}]` (create is idempotent by name) |
 | `orgs.list_api_keys` / `create_api_key` | `/v1/orgs/{org_id}/api-keys` (org keys) |
@@ -310,7 +310,7 @@ org key restricts every key, service key, and session issued under it.
 
 `hot.org.usage()` (runtime) reports one environment's consumption, with
 `env_id` and `usage_scope: "environment"`; its limits come from the billing
-account. Use `orgs.usage(root_org_id)` with an org key for the account total.
+account. Use `orgs.usage(parent_org_id)` with an org key for the account total.
 
 ## Local Development
 
@@ -341,12 +341,12 @@ python3 integration/suborg_fixture.py --hot ../hot/target/debug/hot --backend po
 # For SQLite, use --backend sqlite.
 ```
 
-Coverage includes child and environment provisioning and idempotency, identical
+Coverage includes sub-organization and environment provisioning and idempotency, identical
 project names in siblings, foreign-ID and stream denial, root runtime
 isolation, org/environment key separation (`HotKeyScopeError`), account and
 environment usage, provisioning projects and context through `orgs.env`,
 restricted keys, key rotation, narrowing and revocation, service/session
-issuance and revocation, descendants of a revoked or narrowed org key, and child
+issuance and revocation, descendants of a revoked or narrowed org key, and sub-organization
 suspension and resumption. See [the validation record](integration/VALIDATION.md).
 
 ## Related
