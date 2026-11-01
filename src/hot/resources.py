@@ -833,13 +833,13 @@ class OrgsResource:
         return self._transport.request_json("GET", f"/orgs/{enc(org_id)}")["data"]
 
     def update(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Set a sub-organization's ``state`` (``active``, ``suspended`` or ``archived``); returns the org."""
+        """Set a sub-org's ``state``: ``active``, ``suspended`` or ``archived``. Returns the org."""
         return self._transport.request_json("PATCH", f"/orgs/{enc(org_id)}", json=dict(body))[
             "data"
         ]
 
     def usage(self, org_id: str) -> dict[str, Any]:
-        """Return account usage across the parent organization and its sub-organizations; pass the parent organization's ID."""
+        """Return usage across the parent organization and its sub-orgs; pass the parent's ID."""
         return self._transport.request_json("GET", f"/orgs/{enc(org_id)}/usage")["data"]
 
     def purge_calls(self, org_id: str, *, include_sub_orgs: bool = False) -> dict[str, Any]:
@@ -1965,7 +1965,7 @@ class AsyncOrgsResource:
         return await self._transport.request_json("GET", "/orgs", params=query)
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Create a sub-organization with its default environment; see :meth:`OrgsResource.create`."""
+        """Create a sub-org with its default environment; see :meth:`OrgsResource.create`."""
         return (await self._transport.request_json("POST", "/orgs", json=dict(body)))["data"]
 
     async def get(self, org_id: str) -> dict[str, Any]:
@@ -1973,14 +1973,14 @@ class AsyncOrgsResource:
         return (await self._transport.request_json("GET", f"/orgs/{enc(org_id)}"))["data"]
 
     async def update(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Set a sub-organization's ``state`` (``active``, ``suspended`` or ``archived``); returns the org."""
+        """Set a sub-org's ``state``: ``active``, ``suspended`` or ``archived``. Returns the org."""
         envelope = await self._transport.request_json(
             "PATCH", f"/orgs/{enc(org_id)}", json=dict(body)
         )
         return envelope["data"]
 
     async def usage(self, org_id: str) -> dict[str, Any]:
-        """Return account usage across the parent organization and its sub-organizations; pass the parent organization's ID."""
+        """Return usage across the parent organization and its sub-orgs; pass the parent's ID."""
         return (await self._transport.request_json("GET", f"/orgs/{enc(org_id)}/usage"))["data"]
 
     async def purge_calls(self, org_id: str, *, include_sub_orgs: bool = False) -> dict[str, Any]:
