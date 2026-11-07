@@ -38,7 +38,7 @@ def async_client(handler) -> AsyncHotClient:
     )
 
 
-CHILD = {"name": "Globex", "slug": "globex", "idempotency_key": "leela-org-1"}
+CHILD = {"name": "Globex", "slug": "globex", "idempotency_key": "acme-org-1"}
 KEY = {"description": "events", "permissions": {"event:*": ["create"]}}
 
 EXPECTED = [
