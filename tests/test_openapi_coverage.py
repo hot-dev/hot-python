@@ -1,18 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
 
-from hot import HotClient
+from hot import AsyncHotClient, HotClient
 
 OPERATIONS_PATH = Path(__file__).with_name("openapi_operations.json")
 
 COVERAGE: dict[str, dict[str, str | bool]] = {
-    "GET /status": {
-        "ignored": True,
-        "reason": "Public health endpoint, not part of authenticated SDK resources.",
-    },
+    "GET /status": {"sdk": "status"},
     "GET /v1/projects": {"sdk": "projects.list"},
     "POST /v1/projects": {"sdk": "projects.create"},
     "GET /v1/projects/{project_id_or_slug}": {"sdk": "projects.get"},
@@ -110,30 +108,37 @@ COVERAGE: dict[str, dict[str, str | bool]] = {
 }
 
 
-def test_openapi_operations_have_sdk_coverage_or_explicit_ignore():
+def test_openapi_operations_have_full_sdk_coverage():
     operations = json.loads(OPERATIONS_PATH.read_text())
     operation_keys = {operation_key(operation) for operation in operations}
 
+    assert len(operation_keys) == 85
     assert set(COVERAGE) == operation_keys
+    assert all(not entry.get("ignored") for entry in COVERAGE.values())
 
 
 def test_covered_operations_point_to_existing_sdk_methods():
     with HotClient(token="test-token") as hot:
         for key, entry in COVERAGE.items():
-            if entry.get("ignored") is True:
-                assert entry.get("reason"), key
-                continue
-
             sdk = entry["sdk"]
             assert isinstance(sdk, str)
             assert callable(resolve_sdk_method(hot, sdk)), f"{key} -> hot.{sdk}"
+
+    async def check_async() -> None:
+        async with AsyncHotClient(token="test-token") as ahot:
+            for key, entry in COVERAGE.items():
+                sdk = entry["sdk"]
+                assert isinstance(sdk, str)
+                assert callable(resolve_sdk_method(ahot, sdk)), f"{key} -> ahot.{sdk}"
+
+    asyncio.run(check_async())
 
 
 def operation_key(operation: dict[str, Any]) -> str:
     return f"{operation['method'].upper()} {operation['path']}"
 
 
-def resolve_sdk_method(client: HotClient, path: str) -> Any:
+def resolve_sdk_method(client: HotClient | AsyncHotClient, path: str) -> Any:
     value: Any = client
     for part in path.split("."):
         if part.endswith("()"):

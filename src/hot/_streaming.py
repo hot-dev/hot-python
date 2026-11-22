@@ -6,15 +6,23 @@ import asyncio
 import contextlib
 import random
 import socket
+import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 import httpx
 
-from ._transport import AsyncTransport, SyncTransport, raise_for_status, without_none
-from .errors import HotApiError
+from ._transport import (
+    AsyncTransport,
+    SyncTransport,
+    _normalize_path,
+    raise_for_status,
+    without_none,
+)
+from .errors import HotApiError, HotRunError
 from .sse import consume_sse_blocks
 from .types import StreamEvent
 
@@ -26,10 +34,12 @@ _WRITE_TIMEOUT = 30.0
 
 _BACKOFF_BASE = 0.5
 _BACKOFF_CAP = 10.0
-_MAX_RETRY_AFTER = 60.0
+_MAX_RETRY_AFTER = 30.0
 
-# stream:data chunks held for runs that are not yet correlated.
+# Caps on memory retained for unrelated / not-yet-correlated runs on shared streams.
 _MAX_BUFFERED_CHUNKS = 10_000
+_MAX_FOREIGN_RUNS = 10_000
+_MAX_ORPHAN_EVENTS = 10_000
 
 # How long a failed run whose retry was scheduled waits for its retry run to
 # appear before the failure is reported.
@@ -79,17 +89,18 @@ def _expired(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
-def _stream_timeout(deadline: float | None) -> httpx.Timeout:
-    # ``deadline`` here is the earlier of the deadline and any wake time.
-    if deadline is None:
+def _stream_timeout(deadline: float | None, wake: Wake | None = None) -> httpx.Timeout:
+    target = _target(deadline, wake)
+    if target is None:
         return httpx.Timeout(
             connect=_CONNECT_TIMEOUT,
             read=STREAM_READ_TIMEOUT,
             write=_WRITE_TIMEOUT,
             pool=_CONNECT_TIMEOUT,
         )
-    remaining = deadline - time.monotonic()
+    remaining = target - time.monotonic()
     if remaining <= 0:
+        _raise_if_due(deadline, wake)
         raise StreamDeadline("deadline passed before the stream opened")
     # The read timeout also bounds the wait for response headers.
     return httpx.Timeout(
@@ -109,6 +120,9 @@ class _Watchdog:
 
     def __init__(self, response: httpx.Response, target: float | None) -> None:
         self.fired = False
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._generation = 0
         self._sock = _socket_of(response)
         self._timer: threading.Timer | None = None
         self._target: float | None = None
@@ -116,28 +130,44 @@ class _Watchdog:
 
     def rearm(self, target: float | None) -> None:
         """Move the shutdown to ``target`` (``None``: no shutdown)."""
-        if target == self._target:
-            return
-        self.cancel()
-        self._target = target
-        if target is None:
-            return
-        self._timer = threading.Timer(
-            max(0.0, target - time.monotonic()), self._fire, args=(self._sock,)
-        )
-        self._timer.daemon = True
-        self._timer.start()
+        with self._lock:
+            if self._cancelled or target == self._target:
+                return
+            self._generation += 1
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._target = target
+            if target is None:
+                return
+            generation = self._generation
+            timer = threading.Timer(
+                max(0.0, target - time.monotonic()),
+                self._fire,
+                args=(generation,),
+            )
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
 
-    def _fire(self, sock: socket.socket | None) -> None:
-        self.fired = True
-        if sock is not None:
-            with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
+    def _fire(self, generation: int) -> None:
+        with self._lock:
+            if self._cancelled or generation != self._generation:
+                return
+            self.fired = True
+            sock = self._sock
+            if sock is not None:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
 
     def cancel(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
-            self._timer = None
+        with self._lock:
+            self._cancelled = True
+            self._generation += 1
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._sock = None
 
 
 def _socket_of(response: httpx.Response) -> socket.socket | None:
@@ -158,10 +188,11 @@ def _request_kwargs(
     json: Mapping[str, Any] | None,
     params: Mapping[str, Any] | None,
     deadline: float | None,
+    wake: Wake | None = None,
 ) -> dict[str, Any]:
     return {
         "method": method,
-        "url": f"{transport.api_base_url}{path}",
+        "url": f"{transport.api_base_url}{_normalize_path(path)}",
         "headers": transport.headers(
             {
                 "Accept": "text/event-stream",
@@ -170,8 +201,35 @@ def _request_kwargs(
         ),
         "json": dict(json) if json is not None else None,
         "params": without_none(params),
-        "timeout": _stream_timeout(deadline),
+        "timeout": _stream_timeout(deadline, wake),
     }
+
+
+async def _enter_stream(
+    stream_cm: AbstractAsyncContextManager[httpx.Response],
+    target: float | None,
+) -> httpx.Response:
+    if target is None:
+        return await stream_cm.__aenter__()
+    remaining = target - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    if sys.version_info >= (3, 11):
+        async with asyncio.timeout(remaining):
+            return await stream_cm.__aenter__()
+    return await asyncio.wait_for(stream_cm.__aenter__(), timeout=remaining)
+
+
+async def _anext_chunk(chunks: AsyncIterator[str], target: float | None) -> str:
+    if target is None:
+        return await chunks.__anext__()
+    remaining = target - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    if sys.version_info >= (3, 11):
+        async with asyncio.timeout(remaining):
+            return await chunks.__anext__()
+    return await asyncio.wait_for(chunks.__anext__(), timeout=remaining)
 
 
 def iter_stream(
@@ -183,7 +241,7 @@ def iter_stream(
     params: Mapping[str, Any] | None = None,
     deadline: float | None = None,
     wake: Wake | None = None,
-) -> Iterator[StreamEvent]:
+) -> Generator[StreamEvent, None, None]:
     """Open an SSE request and yield decoded stream events.
 
     ``deadline`` is an absolute ``time.monotonic()`` value. It bounds the
@@ -195,9 +253,9 @@ def iter_stream(
     _raise_if_due(deadline, wake)
     try:
         with transport.client.stream(
-            **_request_kwargs(transport, method, path, json, params, _target(deadline, wake))
+            **_request_kwargs(transport, method, path, json, params, deadline, wake)
         ) as response:
-            if response.is_error:
+            if not response.is_success:
                 response.read()
             raise_for_status(response)
             watchdog = _Watchdog(response, _target(deadline, wake))
@@ -212,8 +270,9 @@ def iter_stream(
                 if watchdog.fired:
                     _raise_if_due(deadline, wake)
                     raise StreamDeadline("deadline passed while streaming")
-                events, _ = consume_sse_blocks(f"{buffer}\n\n")
-                yield from events
+                if buffer:
+                    events, _ = consume_sse_blocks(buffer, flush=True)
+                    yield from events
             except httpx.TransportError as error:
                 if watchdog.fired:
                     _raise_if_due(deadline, wake)
@@ -236,39 +295,46 @@ async def aiter_stream(
     params: Mapping[str, Any] | None = None,
     deadline: float | None = None,
     wake: Wake | None = None,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     """Async variant of :func:`iter_stream`."""
     _raise_if_due(deadline, wake)
     try:
-        async with transport.client.stream(
-            **_request_kwargs(transport, method, path, json, params, _target(deadline, wake))
-        ) as response:
-            if response.is_error:
+        stream_cm = transport.client.stream(
+            **_request_kwargs(transport, method, path, json, params, deadline, wake)
+        )
+        try:
+            response = await _enter_stream(stream_cm, _target(deadline, wake))
+        except (TimeoutError, asyncio.TimeoutError) as error:
+            _raise_if_due(deadline, wake)
+            raise StreamDeadline("deadline passed before the stream opened") from error
+        try:
+            if not response.is_success:
                 await response.aread()
             raise_for_status(response)
-            watchdog = _Watchdog(response, _target(deadline, wake))
-            try:
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    buffer += chunk
-                    events, buffer = consume_sse_blocks(buffer)
-                    for event in events:
-                        yield event
-                    _raise_if_due(deadline, wake)
-                    watchdog.rearm(_target(deadline, wake))
-                if watchdog.fired:
-                    _raise_if_due(deadline, wake)
-                    raise StreamDeadline("deadline passed while streaming")
-                events, _ = consume_sse_blocks(f"{buffer}\n\n")
-                for event in events:
-                    yield event
-            except httpx.TransportError as error:
-                if watchdog.fired:
+            buffer = ""
+            chunks = response.aiter_text()
+            while True:
+                try:
+                    chunk = await _anext_chunk(chunks, _target(deadline, wake))
+                except StopAsyncIteration:
+                    break
+                except (TimeoutError, asyncio.TimeoutError) as error:
                     _raise_if_due(deadline, wake)
                     raise StreamDeadline("deadline passed while streaming") from error
-                raise
-            finally:
-                watchdog.cancel()
+                buffer += chunk
+                events, buffer = consume_sse_blocks(buffer)
+                for event in events:
+                    yield event
+                _raise_if_due(deadline, wake)
+            if buffer:
+                events, _ = consume_sse_blocks(buffer, flush=True)
+                for event in events:
+                    yield event
+        except BaseException as exc:
+            await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            await stream_cm.__aexit__(None, None, None)
     except httpx.TimeoutException:
         if _expired(_target(deadline, wake)):
             _raise_if_due(deadline, wake)
@@ -289,7 +355,7 @@ def backoff_delay(failures: int, retry_after: float | None = None) -> float:
     """Jittered exponential backoff before consecutive failure ``failures``."""
     ceiling = min(_BACKOFF_CAP, _BACKOFF_BASE * 2 ** (failures - 1))
     delay = ceiling / 2 + random.uniform(0, ceiling / 2)
-    if retry_after:
+    if retry_after is not None and retry_after > 0:
         delay = max(delay, min(float(retry_after), _MAX_RETRY_AFTER))
     return delay
 
@@ -300,10 +366,10 @@ class ReconnectPolicy:
     - Any 4xx except 408 and 429 is permanent: the waiter raises it at once.
     - Transport errors, 408, 429 and 5xx reconnect with jittered exponential
       backoff, honouring ``retry_after``.
-    - ``max_attempts`` counts consecutive failed connections. A connection that
-      delivered an event (including the server's 5-minute ``stream:complete``
-      rollover) resets the count and reconnects without delay; a clean end with
-      no events counts as a failure.
+    - ``max_attempts`` counts consecutive failed connections. Explicit
+      ``stream:complete`` rollovers reset the failure count and reconnect
+      without delay; unexpected premature clean EOF backs off and counts as a
+      failure.
     - ``timeout`` is an absolute deadline over connects, reads and backoff.
       A backoff that would cross it raises ``TimeoutError`` instead.
     """
@@ -322,17 +388,27 @@ class ReconnectPolicy:
         self.ended_message = ended_message
         self.failures = 0
         self._delivered = False
+        self._rolled_over = False
 
     def connect(self) -> None:
         """Start a connection; raises ``TimeoutError`` when the deadline has passed."""
         if _expired(self.deadline):
             raise TimeoutError(self.timeout_message)
         self._delivered = False
+        self._rolled_over = False
 
-    def saw(self, _event: StreamEvent) -> None:
+    def saw(self, event: StreamEvent) -> None:
         self._delivered = True
+        if event.get("type") == "stream:complete":
+            self._rolled_over = True
 
-    def after_error(self, error: BaseException, *, published: bool = True) -> float | None:
+    def after_error(
+        self,
+        error: BaseException,
+        *,
+        published: bool = True,
+        wake_at: float | None = None,
+    ) -> float | None:
         """Return the delay before reconnecting, or ``None`` to re-raise ``error``.
 
         ``published=False`` means the request that publishes an event failed,
@@ -352,20 +428,29 @@ class ReconnectPolicy:
         if self.failures > self.max_attempts:
             return None
         retry_after = error.retry_after if isinstance(error, HotApiError) else None
-        return self._bounded(backoff_delay(self.failures, retry_after), error)
+        return self._bounded(backoff_delay(self.failures, retry_after), error, wake_at=wake_at)
 
-    def after_end(self) -> float:
+    def after_end(self, *, wake_at: float | None = None) -> float:
         """Return the delay before reconnecting after a clean end of the stream."""
-        if self._delivered:
+        if self._rolled_over:
             self.failures = 0
             return 0.0
         self.failures += 1
         if self.failures > self.max_attempts:
             raise RuntimeError(self.ended_message)
-        return self._bounded(backoff_delay(self.failures), None)
+        return self._bounded(backoff_delay(self.failures), None, wake_at=wake_at)
 
-    def _bounded(self, delay: float, error: BaseException | None) -> float:
-        if self.deadline is not None and time.monotonic() + delay >= self.deadline:
+    def _bounded(
+        self,
+        delay: float,
+        error: BaseException | None,
+        *,
+        wake_at: float | None = None,
+    ) -> float:
+        now = time.monotonic()
+        if wake_at is not None and now + delay >= wake_at:
+            raise StreamWake()
+        if self.deadline is not None and now + delay >= self.deadline:
             raise TimeoutError(self.timeout_message) from error
         return delay
 
@@ -383,7 +468,8 @@ def _emit_chunk(event: StreamEvent, on_chunk: Callable[[str], None] | None) -> N
 class RunCorrelator:
     """Follow the runs a published event starts on its stream, in any arrival order.
 
-    A run belongs to the event when its ``event_id`` is the event's, or its
+    A run belongs to the event when its ``event_id`` is the event's, it was
+    named as ``retry_run_id`` on a correlated run's ``run:fail``, or its
     ``origin_run_id`` names a run that does and its ``run_type`` is that run's:
     the retry of a failed attempt gets a new ``event_id``. A task run also
     names the run that started it as its origin, but has another ``run_type``.
@@ -395,23 +481,27 @@ class RunCorrelator:
     ``run:stop`` with status ``pending_retry``, or, once the retry is queued
     and before the retry run exists, as ``run:fail`` with status ``failed``.
     So a ``pending_retry`` status is never final; a run that a retry run names
-    as its origin is not final; and a ``failed`` run whose ``retry_attempt``
-    shows a scheduled retry is held for ``RETRY_GRACE`` seconds and reported
-    (see :meth:`wake_at` and :meth:`expire`) only if no retry run appears.
+    as its origin (or whose ``run:fail`` names a ``retry_run_id``) is not final;
+    and a ``failed`` run whose ``retry_attempt`` shows a scheduled retry is held
+    for ``RETRY_GRACE`` seconds and reported (see :meth:`wake_at` and
+    :meth:`expire`) only if no retry run appears.
     """
 
-    def __init__(self, event_id: str | None, on_chunk: Callable[[str], None] | None = None):
+    def __init__(self, event_id: str | None, on_chunk: Callable[[str], None] | None = None) -> None:
         self.event_id = event_id
         self.on_chunk = on_chunk
         # Correlated runs and the highest retry_attempt seen for each.
         self._runs: dict[str, int] = {}
         # Each correlated run's run_type; a retry has its origin's.
         self._types: dict[str, Any] = {}
-        # Correlated runs that a correlated retry run names as its origin.
+        # Recorded origin run for runs correlated via retry_run_id.
+        self._origins: dict[str, str] = {}
+        # Correlated runs that a correlated retry run names as its origin (or retry_run_id).
         self._retried: set[str] = set()
         # Run events whose origin run is not correlated yet, by origin_run_id.
-        self._orphans: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-        self._foreign: set[str] = set()
+        self._orphans: dict[str, list[tuple[str, dict[str, Any], str | None]]] = {}
+        self._orphan_count = 0
+        self._foreign: dict[str, None] = {}
         self._held: dict[str, list[StreamEvent]] = {}
         self._held_count = 0
         # A failure that stands unless its retry appears: (run_id, until, run).
@@ -429,7 +519,9 @@ class RunCorrelator:
         run = event.get("run")
         if not isinstance(run, dict) or not isinstance(run.get("run_id"), str):
             return None
-        return self._run_event(event_type, run)
+        raw_retry = event.get("retry_run_id") if event_type == "run:fail" else None
+        retry_run_id = raw_retry if isinstance(raw_retry, str) and raw_retry else None
+        return self._run_event(event_type, run, retry_run_id=retry_run_id)
 
     def handle(self, event: StreamEvent) -> dict[str, Any] | None:
         """Return the run when the event's run succeeds; raise when it fails or is cancelled."""
@@ -451,12 +543,15 @@ class RunCorrelator:
 
     def _result(self, event_type: str, run: dict[str, Any]) -> dict[str, Any]:
         if event_type == "run:fail":
-            raise RuntimeError(run_result_message(run, "Run failed"))
+            raise HotRunError(run, message=run_result_message(run, "Run failed"))
         if event_type == "run:cancel":
-            raise RuntimeError(run_result_message(run, "Run cancelled"))
+            raise HotRunError(run, message=run_result_message(run, "Run cancelled"))
         return run
 
     def _ties(self, run: Mapping[str, Any]) -> bool:
+        run_id = run.get("run_id")
+        if isinstance(run_id, str) and run_id in self._runs:
+            return True
         if self.event_id is not None and run.get("event_id") == self.event_id:
             return True
         # A task run names the run that started it as its origin too, but
@@ -468,44 +563,81 @@ class RunCorrelator:
             and self._types[origin] == run.get("run_type")
         )
 
-    def _run_event(self, event_type: str, run: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    def _record_foreign(self, run_id: str) -> None:
+        if run_id not in self._foreign:
+            if len(self._foreign) >= _MAX_FOREIGN_RUNS:
+                self._foreign.pop(next(iter(self._foreign)))
+            self._foreign[run_id] = None
+        self._held_count -= len(self._held.pop(run_id, []))
+
+    def _record_orphan(
+        self, origin: str, event_type: str, run: dict[str, Any], retry_run_id: str | None
+    ) -> None:
+        while self._orphan_count >= _MAX_ORPHAN_EVENTS and self._orphans:
+            oldest = next(iter(self._orphans))
+            self._orphan_count -= len(self._orphans.pop(oldest))
+        if _MAX_ORPHAN_EVENTS <= 0:
+            return
+        self._orphans.setdefault(origin, []).append((event_type, run, retry_run_id))
+        self._orphan_count += 1
+
+    def _register_run(
+        self, run_id: str, attempt: int, run_type: Any
+    ) -> list[tuple[str, dict[str, Any], str | None]]:
+        self._foreign.pop(run_id, None)
+        if run_id in self._runs:
+            self._runs[run_id] = max(self._runs[run_id], attempt)
+            if self._types[run_id] is None and run_type is not None:
+                self._types[run_id] = run_type
+            return []
+        self._runs[run_id] = attempt
+        self._types[run_id] = run_type
+        for held in self._held.pop(run_id, []):
+            self._held_count -= 1
+            _emit_chunk(held, self.on_chunk)
+        popped = self._orphans.pop(run_id, [])
+        self._orphan_count -= len(popped)
+        orphans = [orphan for orphan in popped if orphan[1].get("run_type") == self._types[run_id]]
+        if orphans:
+            # A retry of this run is already on the stream.
+            self._retried.add(run_id)
+        return orphans
+
+    def _run_event(
+        self,
+        event_type: str,
+        run: dict[str, Any],
+        *,
+        retry_run_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
         run_id = run["run_id"]
         origin = run.get("origin_run_id")
         if not self._ties(run):
             if isinstance(origin, str) and origin not in self._runs:
                 # A retry whose origin is not known yet may still turn out to be ours.
-                self._orphans.setdefault(origin, []).append((event_type, run))
+                self._record_orphan(origin, event_type, run, retry_run_id)
             elif self.event_id is not None:
-                self._foreign.add(run_id)
-                self._held_count -= len(self._held.pop(run_id, []))
+                self._record_foreign(run_id)
             return None
         attempt = _retry_attempt(run)
-        orphans: list[tuple[str, dict[str, Any]]] = []
-        if run_id in self._runs:
-            self._runs[run_id] = max(self._runs[run_id], attempt)
-        else:
-            self._runs[run_id] = attempt
-            self._types[run_id] = run.get("run_type")
-            for held in self._held.pop(run_id, []):
-                self._held_count -= 1
-                _emit_chunk(held, self.on_chunk)
-            orphans = [
-                (orphan_type, orphan)
-                for orphan_type, orphan in self._orphans.pop(run_id, [])
-                if orphan.get("run_type") == self._types[run_id]
-            ]
-            if orphans:
-                # A retry of this run is already on the stream.
-                self._retried.add(run_id)
+        orphans = self._register_run(run_id, attempt, run.get("run_type"))
         if isinstance(origin, str):
             self._retried.add(origin)
             if self._pending is not None and self._pending[0] == origin:
                 self._pending = None
+        if retry_run_id is not None:
+            self._retried.add(run_id)
+            if self._pending is not None and self._pending[0] == run_id:
+                self._pending = None
+            self._origins.setdefault(retry_run_id, run_id)
+            orphans.extend(
+                self._register_run(retry_run_id, self._runs[run_id], self._types[run_id])
+            )
         ended = self._outcome(event_type, run_id, run)
         if ended is not None:
             return ended
-        for orphan_type, orphan in orphans:
-            ended = self._run_event(orphan_type, orphan)
+        for orphan_type, orphan_run, orphan_retry_run_id in orphans:
+            ended = self._run_event(orphan_type, orphan_run, retry_run_id=orphan_retry_run_id)
             if ended is not None:
                 return ended
         return None
@@ -521,7 +653,7 @@ class RunCorrelator:
             return None
         # retry_attempt goes up when a retry is scheduled; a run's own attempt
         # number is its origin's (0 for a first attempt).
-        origin = run.get("origin_run_id")
+        origin = run.get("origin_run_id") or self._origins.get(run_id)
         base = self._runs.get(origin, 0) if isinstance(origin, str) else 0
         if _retry_attempt(run) > base:
             if self._pending is None:

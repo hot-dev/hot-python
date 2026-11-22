@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping
 from contextlib import aclosing, asynccontextmanager, closing, contextmanager
 from typing import Any
 from urllib.parse import quote
@@ -9,30 +9,28 @@ import httpx
 
 from . import _streaming
 from ._streaming import ReconnectPolicy, RunCorrelator, StreamWake, aiter_stream, iter_stream
-from ._transport import AsyncTransport, SyncTransport
+from ._transport import AsyncTransport, SyncTransport, parse_data
 from .errors import HotRunError, HotTaskError
 from .types import StreamEvent
 
 
 def enc(value: str) -> str:
     """Percent-encode a single path segment, including any slash."""
+    if value in ("", ".", ".."):
+        raise ValueError(f"Invalid path segment: {value!r}")
     return quote(value, safe="")
 
 
 def enc_path(path: str) -> str:
     """Percent-encode each segment of a slash-separated path."""
-    return "/".join(quote(part, safe="") for part in path.split("/"))
-
-
-def _run_id_of(event: Any) -> str | None:
-    if not isinstance(event, dict):
-        return None
-    run = event.get("run")
-    if isinstance(run, dict):
-        run_id = run.get("run_id")
-        if isinstance(run_id, str):
-            return run_id
-    return None
+    trimmed = path.removeprefix("/")
+    if not trimmed:
+        raise ValueError(f"Invalid path: {path!r}")
+    parts = trimmed.split("/")
+    for part in parts:
+        if part in ("", ".", ".."):
+            raise ValueError(f"Invalid path segment {part!r} in path {path!r}")
+    return "/".join(quote(part, safe="") for part in parts)
 
 
 def _extract_run_result(result: Any) -> Any:
@@ -82,7 +80,7 @@ class EventsResource:
 
     def publish(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Publish an event and return the created event data."""
-        return self._transport.request_json("POST", "/events", json=dict(body))["data"]
+        return self._transport.request_data("POST", "/events", json=dict(body))
 
     def call_hot(
         self,
@@ -115,7 +113,7 @@ class EventsResource:
 
     def get(self, event_id: str) -> dict[str, Any]:
         """Return a single event."""
-        return self._transport.request_json("GET", f"/events/{enc(event_id)}")["data"]
+        return self._transport.request_data("GET", f"/events/{enc(event_id)}")
 
     def get_runs(self, event_id: str) -> dict[str, Any]:
         """Return the runs triggered by an event."""
@@ -132,17 +130,17 @@ class RunsResource:
 
     def stats(self) -> dict[str, Any]:
         """Return aggregate run statistics."""
-        return self._transport.request_json("GET", "/runs/stats")["data"]
+        return self._transport.request_data("GET", "/runs/stats")
 
     def get(self, run_id: str) -> dict[str, Any]:
         """Return a single run."""
-        return self._transport.request_json("GET", f"/runs/{enc(run_id)}")["data"]
+        return self._transport.request_data("GET", f"/runs/{enc(run_id)}")
 
     def purge_calls(self, run_id: str) -> dict[str, Any]:
         """Delete the run's call traces."""
-        return self._transport.request_json("DELETE", f"/runs/{enc(run_id)}/calls")["data"]
+        return self._transport.request_data("DELETE", f"/runs/{enc(run_id)}/calls")
 
-    def subscribe(self, run_id: str) -> Iterator[StreamEvent]:
+    def subscribe(self, run_id: str) -> Generator[StreamEvent, None, None]:
         """Yield durable run snapshots until the run becomes terminal."""
         yield from iter_stream(
             self._transport,
@@ -194,15 +192,15 @@ class EnvResource:
 
     def get(self) -> dict[str, Any]:
         """Return environment info."""
-        return self._transport.request_json("GET", "/env")["data"]
+        return self._transport.request_data("GET", "/env")
 
-    def subscribe(self) -> Iterator[StreamEvent]:
+    def subscribe(self) -> Generator[StreamEvent, None, None]:
         """Stream environment events (requires API key credentials and pub/sub)."""
         yield from iter_stream(self._transport, "GET", "/env/subscribe")
 
     def purge_calls(self) -> dict[str, Any]:
         """Delete every call trace in the environment."""
-        return self._transport.request_json("DELETE", "/env/calls")["data"]
+        return self._transport.request_data("DELETE", "/env/calls")
 
 
 class OrgResource:
@@ -211,14 +209,16 @@ class OrgResource:
 
     def usage(self) -> dict[str, Any]:
         """Return organization usage and limits."""
-        return self._transport.request_json("GET", "/org/usage")["data"]
+        return self._transport.request_data("GET", "/org/usage")
 
 
 class StreamsResource:
     def __init__(self, transport: SyncTransport) -> None:
         self._transport = transport
 
-    def subscribe(self, stream_id: str, *, project: str | None = None) -> Iterator[StreamEvent]:
+    def subscribe(
+        self, stream_id: str, *, project: str | None = None
+    ) -> Generator[StreamEvent, None, None]:
         """Stream events from an existing run stream."""
         yield from iter_stream(
             self._transport,
@@ -232,7 +232,7 @@ class StreamsResource:
         stream_id: str,
         *,
         project: str | None = None,
-    ) -> Iterator[StreamEvent]:
+    ) -> Generator[StreamEvent, None, None]:
         """Stream events from an existing run stream via POST."""
         yield from iter_stream(
             self._transport,
@@ -243,7 +243,7 @@ class StreamsResource:
 
     def purge_calls(self, stream_id: str) -> dict[str, Any]:
         """Delete the call traces of every run on the stream."""
-        return self._transport.request_json("DELETE", f"/streams/{enc(stream_id)}/calls")["data"]
+        return self._transport.request_data("DELETE", f"/streams/{enc(stream_id)}/calls")
 
     def wait_for_run_result(
         self,
@@ -254,7 +254,7 @@ class StreamsResource:
         on_chunk: Callable[[str], None] | None = None,
         max_attempts: int = 5,
     ) -> dict[str, Any]:
-        """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError.
+        """Wait for the run created by ``event_id``; run:fail/run:cancel raise HotRunError.
 
         A run with status ``pending_retry`` is not final: the wait follows the
         retry run, linked by ``origin_run_id``. A ``failed`` run whose retry
@@ -279,7 +279,7 @@ class StreamsResource:
         reconnect: bool = True,
         max_attempts: int = 5,
         timeout: float | None = None,
-    ) -> Iterator[StreamEvent]:
+    ) -> Generator[StreamEvent, None, None]:
         """Atomically subscribe then publish.
 
         The Hot API closes every stream subscription 5 minutes after it opens,
@@ -345,13 +345,21 @@ class StreamsResource:
                     # A failure held for its retry stands; its run:fail was yielded.
                     return
                 except Exception as error:
-                    delay = policy.after_error(error, published=stream_id is not None)
+                    try:
+                        delay = policy.after_error(
+                            error, published=stream_id is not None, wake_at=runs.wake_at()
+                        )
+                    except StreamWake:
+                        return
                     if delay is None:
                         raise
                 else:
                     if stream_id is None:
                         raise RuntimeError("stream ended before event:published was received")
-                    delay = policy.after_end()
+                    try:
+                        delay = policy.after_end(wake_at=runs.wake_at())
+                    except StreamWake:
+                        return
                 _streaming.sleep(delay)
         except TimeoutError:
             # A failure held for its retry stands at the deadline; its
@@ -366,7 +374,7 @@ class StreamsResource:
         project: str | None = None,
         deadline: float | None = None,
         wake: _streaming.Wake | None = None,
-    ) -> Iterator[StreamEvent]:
+    ) -> Generator[StreamEvent, None, None]:
         yield from iter_stream(
             self._transport,
             "POST",
@@ -384,9 +392,9 @@ class TasksResource:
 
     def get(self, task_id: str) -> dict[str, Any]:
         """Return the latest durable task snapshot."""
-        return self._transport.request_json("GET", f"/tasks/{enc(task_id)}")["data"]
+        return self._transport.request_data("GET", f"/tasks/{enc(task_id)}")
 
-    def subscribe(self, task_id: str) -> Iterator[StreamEvent]:
+    def subscribe(self, task_id: str) -> Generator[StreamEvent, None, None]:
         """Yield durable task snapshots until the task becomes terminal."""
         yield from iter_stream(
             self._transport,
@@ -442,11 +450,11 @@ class FilesResource:
 
     def get(self, file_id: str) -> dict[str, Any]:
         """Return a single file's metadata."""
-        return self._transport.request_json("GET", f"/files/{enc(file_id)}")["data"]
+        return self._transport.request_data("GET", f"/files/{enc(file_id)}")
 
     def delete(self, file_id: str) -> None:
         """Delete a file."""
-        self._transport.request_raw("DELETE", f"/files/{enc(file_id)}")
+        self._transport.request_json("DELETE", f"/files/{enc(file_id)}")
 
     def download(self, file_id: str) -> httpx.Response:
         """Return the HTTP response with the whole file read into memory.
@@ -482,11 +490,11 @@ class FilesResource:
                 **({"Content-Type": content_type} if content_type else {}),
             },
         )
-        return response.json()["data"]
+        return parse_data(response)
 
     def initiate_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Start a multipart upload."""
-        return self._transport.request_json("POST", "/files/uploads", json=dict(body))["data"]
+        return self._transport.request_data("POST", "/files/uploads", json=dict(body))
 
     def upload_part(self, upload_id: str, part_number: int, content: bytes | str) -> dict[str, Any]:
         """Upload one part of a multipart upload."""
@@ -496,18 +504,18 @@ class FilesResource:
             content=content,
             headers={"Accept": "application/json"},
         )
-        return response.json()["data"]
+        return parse_data(response)
 
     def complete_upload(self, upload_id: str) -> dict[str, Any]:
         """Finish a multipart upload."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST",
             f"/files/uploads/{enc(upload_id)}/complete",
-        )["data"]
+        )
 
     def abort_upload(self, upload_id: str) -> None:
         """Cancel a multipart upload."""
-        self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
+        self._transport.request_json("DELETE", f"/files/uploads/{enc(upload_id)}")
 
 
 class BlobsResource:
@@ -546,39 +554,35 @@ class ProjectsResource:
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a project."""
-        return self._transport.request_json("POST", f"{self._prefix}/projects", json=dict(body))[
-            "data"
-        ]
+        return self._transport.request_data("POST", f"{self._prefix}/projects", json=dict(body))
 
     def get(self, project: str) -> dict[str, Any]:
         """Return a project by id or slug."""
-        return self._transport.request_json("GET", f"{self._prefix}/projects/{enc(project)}")[
-            "data"
-        ]
+        return self._transport.request_data("GET", f"{self._prefix}/projects/{enc(project)}")
 
     def update(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Patch a project."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "PATCH",
             f"{self._prefix}/projects/{enc(project)}",
             json=dict(body),
-        )["data"]
+        )
 
     def delete(self, project: str) -> None:
         """Delete a project."""
-        self._transport.request_raw("DELETE", f"{self._prefix}/projects/{enc(project)}")
+        self._transport.request_json("DELETE", f"{self._prefix}/projects/{enc(project)}")
 
     def activate(self, project: str) -> dict[str, Any]:
         """Activate a project."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST", f"{self._prefix}/projects/{enc(project)}/activate"
-        )["data"]
+        )
 
     def deactivate(self, project: str) -> dict[str, Any]:
         """Deactivate a project."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST", f"{self._prefix}/projects/{enc(project)}/deactivate"
-        )["data"]
+        )
 
     def event_handlers(self, project: str) -> dict[str, Any]:
         """Return the project's event handlers."""
@@ -612,23 +616,23 @@ class BuildsResource:
 
     def get(self, project: str, build_id: str) -> dict[str, Any]:
         """Return a single build."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "GET",
             f"{self._prefix}/projects/{enc(project)}/builds/{enc(build_id)}",
-        )["data"]
+        )
 
     def deployed(self, project: str) -> dict[str, Any]:
         """Return the project's deployed build."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "GET",
             f"{self._prefix}/projects/{enc(project)}/builds/deployed",
-        )["data"]
+        )
 
     def live(self, project: str) -> dict[str, Any]:
         """Return the project's live build."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "GET", f"{self._prefix}/projects/{enc(project)}/builds/live"
-        )["data"]
+        )
 
     def upload(
         self,
@@ -647,7 +651,7 @@ class BuildsResource:
             files={"file": file},
             headers={"Accept": "application/json"},
         )
-        return response.json()["data"]
+        return parse_data(response)
 
     def download(self, project: str, build_id: str) -> httpx.Response:
         """Return the HTTP response with the whole build archive read into memory.
@@ -670,10 +674,10 @@ class BuildsResource:
 
     def deploy(self, project: str, build_id: str) -> dict[str, Any]:
         """Deploy a build."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST",
             f"{self._prefix}/projects/{enc(project)}/builds/{enc(build_id)}/deploy",
-        )["data"]
+        )
 
 
 class ContextResource:
@@ -689,23 +693,23 @@ class ContextResource:
 
     def create(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a context variable."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST",
             f"{self._prefix}/projects/{enc(project)}/context",
             json=dict(body),
-        )["data"]
+        )
 
     def update(self, project: str, key: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Replace a context variable."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "PUT",
             f"{self._prefix}/projects/{enc(project)}/context/{enc(key)}",
             json=dict(body),
-        )["data"]
+        )
 
     def delete(self, project: str, key: str) -> None:
         """Delete a context variable."""
-        self._transport.request_raw(
+        self._transport.request_json(
             "DELETE", f"{self._prefix}/projects/{enc(project)}/context/{enc(key)}"
         )
 
@@ -716,7 +720,7 @@ class DomainsResource:
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Register a custom domain."""
-        return self._transport.request_json("POST", "/domains", json=dict(body))["data"]
+        return self._transport.request_data("POST", "/domains", json=dict(body))
 
     def list(self) -> dict[str, Any]:
         """Return the domain list envelope."""
@@ -724,15 +728,15 @@ class DomainsResource:
 
     def get(self, domain_id: str) -> dict[str, Any]:
         """Return a single domain."""
-        return self._transport.request_json("GET", f"/domains/{enc(domain_id)}")["data"]
+        return self._transport.request_data("GET", f"/domains/{enc(domain_id)}")
 
     def delete(self, domain_id: str) -> None:
         """Delete a domain."""
-        self._transport.request_raw("DELETE", f"/domains/{enc(domain_id)}")
+        self._transport.request_json("DELETE", f"/domains/{enc(domain_id)}")
 
     def verify(self, domain_id: str) -> dict[str, Any]:
         """Trigger domain verification."""
-        return self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify")["data"]
+        return self._transport.request_data("POST", f"/domains/{enc(domain_id)}/verify")
 
 
 class SessionsResource:
@@ -741,7 +745,7 @@ class SessionsResource:
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a scoped session."""
-        return self._transport.request_json("POST", "/sessions", json=dict(body))["data"]
+        return self._transport.request_data("POST", "/sessions", json=dict(body))
 
     def list(self, **query: Any) -> dict[str, Any]:
         """Return the session list envelope."""
@@ -749,11 +753,11 @@ class SessionsResource:
 
     def revoke(self, session_id: str) -> None:
         """Revoke one session."""
-        self._transport.request_raw("DELETE", f"/sessions/{enc(session_id)}")
+        self._transport.request_json("DELETE", f"/sessions/{enc(session_id)}")
 
     def revoke_all(self) -> dict[str, Any]:
         """Revoke every session."""
-        return self._transport.request_json("DELETE", "/sessions")["data"]
+        return self._transport.request_data("DELETE", "/sessions")
 
 
 class ServiceKeysResource:
@@ -762,7 +766,7 @@ class ServiceKeysResource:
 
     def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a scoped service key."""
-        return self._transport.request_json("POST", "/service-keys", json=dict(body))["data"]
+        return self._transport.request_data("POST", "/service-keys", json=dict(body))
 
     def list(self, **query: Any) -> dict[str, Any]:
         """Return the service key list envelope."""
@@ -770,26 +774,26 @@ class ServiceKeysResource:
 
     def get(self, service_key_id: str) -> dict[str, Any]:
         """Return a single service key."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "GET",
             f"/service-keys/{enc(service_key_id)}",
-        )["data"]
+        )
 
     def update(self, service_key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Patch a service key."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "PATCH",
             f"/service-keys/{enc(service_key_id)}",
             json=dict(body),
-        )["data"]
+        )
 
     def revoke(self, service_key_id: str) -> None:
         """Revoke one service key."""
-        self._transport.request_raw("DELETE", f"/service-keys/{enc(service_key_id)}")
+        self._transport.request_json("DELETE", f"/service-keys/{enc(service_key_id)}")
 
     def revoke_all(self) -> dict[str, Any]:
         """Revoke every service key."""
-        return self._transport.request_json("DELETE", "/service-keys")["data"]
+        return self._transport.request_data("DELETE", "/service-keys")
 
 
 class OrgEnv:
@@ -826,29 +830,27 @@ class OrgsResource:
         ``env_id`` and ``created`` (false when the idempotency key matched an
         earlier request).
         """
-        return self._transport.request_json("POST", "/orgs", json=dict(body))["data"]
+        return self._transport.request_data("POST", "/orgs", json=dict(body))
 
     def get(self, org_id: str) -> dict[str, Any]:
         """Return one organization."""
-        return self._transport.request_json("GET", f"/orgs/{enc(org_id)}")["data"]
+        return self._transport.request_data("GET", f"/orgs/{enc(org_id)}")
 
     def update(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Set a sub-org's ``state``: ``active``, ``suspended`` or ``archived``. Returns the org."""
-        return self._transport.request_json("PATCH", f"/orgs/{enc(org_id)}", json=dict(body))[
-            "data"
-        ]
+        return self._transport.request_data("PATCH", f"/orgs/{enc(org_id)}", json=dict(body))
 
     def usage(self, org_id: str) -> dict[str, Any]:
         """Return usage across the parent organization and its sub-orgs; pass the parent's ID."""
-        return self._transport.request_json("GET", f"/orgs/{enc(org_id)}/usage")["data"]
+        return self._transport.request_data("GET", f"/orgs/{enc(org_id)}/usage")
 
     def purge_calls(self, org_id: str, *, include_sub_orgs: bool = False) -> dict[str, Any]:
         """Delete every call trace in the org's environments (and its sub-organizations')."""
-        return self._transport.request_json(
+        return self._transport.request_data(
             "DELETE",
             f"/orgs/{enc(org_id)}/calls",
             params={"include_sub_orgs": "true" if include_sub_orgs else None},
-        )["data"]
+        )
 
     def list_envs(self, org_id: str) -> dict[str, Any]:
         """Return the environment list envelope for an org."""
@@ -856,15 +858,11 @@ class OrgsResource:
 
     def create_env(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create an environment; idempotent by exact ``name`` within the org."""
-        return self._transport.request_json("POST", f"/orgs/{enc(org_id)}/envs", json=dict(body))[
-            "data"
-        ]
+        return self._transport.request_data("POST", f"/orgs/{enc(org_id)}/envs", json=dict(body))
 
     def get_env(self, org_id: str, env_id: str) -> dict[str, Any]:
         """Return one environment."""
-        return self._transport.request_json("GET", f"/orgs/{enc(org_id)}/envs/{enc(env_id)}")[
-            "data"
-        ]
+        return self._transport.request_data("GET", f"/orgs/{enc(org_id)}/envs/{enc(env_id)}")
 
     def list_api_keys(self, org_id: str, **query: Any) -> dict[str, Any]:
         """Return the list envelope of the org's own org API keys."""
@@ -875,9 +873,9 @@ class OrgsResource:
 
         The response's ``token`` is returned only once.
         """
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST", f"/orgs/{enc(org_id)}/api-keys", json=dict(body)
-        )["data"]
+        )
 
     def list_env_api_keys(self, org_id: str, env_id: str, **query: Any) -> dict[str, Any]:
         """Return the list envelope of an environment's API keys."""
@@ -892,11 +890,11 @@ class OrgsResource:
 
         The response's ``token`` is returned only once.
         """
-        return self._transport.request_json(
+        return self._transport.request_data(
             "POST",
             f"/orgs/{enc(org_id)}/envs/{enc(env_id)}/api-keys",
             json=dict(body),
-        )["data"]
+        )
 
     def env(self, org_id: str, env_id: str) -> OrgEnv:
         """Projects, builds and context in one of the org's environments."""
@@ -911,17 +909,15 @@ class ApiKeysResource:
 
     def get(self, key_id: str) -> dict[str, Any]:
         """Return one API key (never its secret)."""
-        return self._transport.request_json("GET", f"/api-keys/{enc(key_id)}")["data"]
+        return self._transport.request_data("GET", f"/api-keys/{enc(key_id)}")
 
     def update(self, key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Replace a key's ``permissions``; they must fit inside the caller's own."""
-        return self._transport.request_json("PATCH", f"/api-keys/{enc(key_id)}", json=dict(body))[
-            "data"
-        ]
+        return self._transport.request_data("PATCH", f"/api-keys/{enc(key_id)}", json=dict(body))
 
     def revoke(self, key_id: str) -> None:
         """Revoke a key. Everything it issued stops on its next request."""
-        self._transport.request_raw("DELETE", f"/api-keys/{enc(key_id)}")
+        self._transport.request_json("DELETE", f"/api-keys/{enc(key_id)}")
 
     def rotate(self, key_id: str, *, overlap_seconds: int | None = None) -> dict[str, Any]:
         """Issue a new secret for the same key; the old one works for ``overlap_seconds``.
@@ -930,9 +926,7 @@ class ApiKeysResource:
         response's ``token`` is returned only once.
         """
         body = {} if overlap_seconds is None else {"overlap_seconds": overlap_seconds}
-        return self._transport.request_json("POST", f"/api-keys/{enc(key_id)}/rotate", json=body)[
-            "data"
-        ]
+        return self._transport.request_data("POST", f"/api-keys/{enc(key_id)}/rotate", json=body)
 
 
 def _event_policy(timeout: float | None, max_attempts: int) -> ReconnectPolicy:
@@ -944,23 +938,39 @@ def _event_policy(timeout: float | None, max_attempts: int) -> ReconnectPolicy:
     )
 
 
+_MAX_DEDUPE_ENTRIES = 10_000
+
+
 class _RunEventDedupe:
     """Drop ``run:start`` and terminal events a reconnect replays."""
 
-    def __init__(self) -> None:
-        self._seen: set[tuple[str, str]] = set()
+    def __init__(self, max_entries: int = _MAX_DEDUPE_ENTRIES) -> None:
+        self._max_entries = max_entries
+        self._seen: dict[tuple[str, str], None] = {}
 
     def replayed(self, event: StreamEvent) -> bool:
         event_type = event.get("type")
         if event_type not in ("run:start", "run:stop", "run:fail", "run:cancel"):
             return False
-        run_id = _run_id_of(event)
-        if run_id is None:
+        run = event.get("run")
+        if not isinstance(run, dict):
             return False
-        key = ("start" if event_type == "run:start" else "end", run_id)
+        run_id = run.get("run_id")
+        if not isinstance(run_id, str):
+            return False
+        if event_type == "run:start":
+            kind = "start"
+        elif run.get("status") == "pending_retry":
+            kind = "pending_retry"
+        else:
+            kind = "end"
+        key = (kind, run_id)
         if key in self._seen:
             return True
-        self._seen.add(key)
+        if len(self._seen) >= self._max_entries and self._seen:
+            self._seen.pop(next(iter(self._seen)))
+        if self._max_entries > 0:
+            self._seen[key] = None
         return False
 
 
@@ -996,7 +1006,7 @@ def wait_for_run_result(
     on_chunk: Callable[[str], None] | None = None,
     max_attempts: int = 5,
 ) -> dict[str, Any]:
-    """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
+    """Wait for the run created by ``event_id``; run:fail/run:cancel raise HotRunError."""
     policy = _run_policy(timeout, max_attempts)
     runs = RunCorrelator(event_id, on_chunk)
     try:
@@ -1021,11 +1031,21 @@ def wait_for_run_result(
                 runs.expire()
                 delay = 0.0
             except Exception as error:
-                delay = policy.after_error(error)
-                if delay is None:
-                    raise
+                try:
+                    retry_delay = policy.after_error(error, wake_at=runs.wake_at())
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
+                else:
+                    if retry_delay is None:
+                        raise
+                    delay = retry_delay
             else:
-                delay = policy.after_end()
+                try:
+                    delay = policy.after_end(wake_at=runs.wake_at())
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
             _streaming.sleep(delay)
     except TimeoutError:
         # A failure held for its retry stands at the deadline.
@@ -1080,13 +1100,25 @@ def wait_for_call_result(
                 runs.expire()
                 delay = 0.0
             except Exception as error:
-                delay = policy.after_error(error, published=stream_id is not None)
-                if delay is None:
-                    raise
+                try:
+                    retry_delay = policy.after_error(
+                        error, published=stream_id is not None, wake_at=runs.wake_at()
+                    )
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
+                else:
+                    if retry_delay is None:
+                        raise
+                    delay = retry_delay
             else:
                 if stream_id is None:
                     raise RuntimeError("stream ended before event:published was received")
-                delay = policy.after_end()
+                try:
+                    delay = policy.after_end(wake_at=runs.wake_at())
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
             _streaming.sleep(delay)
     except TimeoutError:
         # A failure held for its retry stands at the deadline.
@@ -1103,7 +1135,7 @@ async def async_wait_for_run_result(
     on_chunk: Callable[[str], None] | None = None,
     max_attempts: int = 5,
 ) -> dict[str, Any]:
-    """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError."""
+    """Wait for the run created by ``event_id``; run:fail/run:cancel raise HotRunError."""
     policy = _run_policy(timeout, max_attempts)
     runs = RunCorrelator(event_id, on_chunk)
     try:
@@ -1128,11 +1160,21 @@ async def async_wait_for_run_result(
                 runs.expire()
                 delay = 0.0
             except Exception as error:
-                delay = policy.after_error(error)
-                if delay is None:
-                    raise
+                try:
+                    retry_delay = policy.after_error(error, wake_at=runs.wake_at())
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
+                else:
+                    if retry_delay is None:
+                        raise
+                    delay = retry_delay
             else:
-                delay = policy.after_end()
+                try:
+                    delay = policy.after_end(wake_at=runs.wake_at())
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
             await _streaming.asleep(delay)
     except TimeoutError:
         # A failure held for its retry stands at the deadline.
@@ -1187,13 +1229,25 @@ async def async_wait_for_call_result(
                 runs.expire()
                 delay = 0.0
             except Exception as error:
-                delay = policy.after_error(error, published=stream_id is not None)
-                if delay is None:
-                    raise
+                try:
+                    retry_delay = policy.after_error(
+                        error, published=stream_id is not None, wake_at=runs.wake_at()
+                    )
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
+                else:
+                    if retry_delay is None:
+                        raise
+                    delay = retry_delay
             else:
                 if stream_id is None:
                     raise RuntimeError("stream ended before event:published was received")
-                delay = policy.after_end()
+                try:
+                    delay = policy.after_end(wake_at=runs.wake_at())
+                except StreamWake:
+                    runs.expire()
+                    delay = 0.0
             await _streaming.asleep(delay)
     except TimeoutError:
         # A failure held for its retry stands at the deadline.
@@ -1207,7 +1261,7 @@ class AsyncEventsResource:
 
     async def publish(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Publish an event and return the created event data."""
-        return (await self._transport.request_json("POST", "/events", json=dict(body)))["data"]
+        return await self._transport.request_data("POST", "/events", json=dict(body))
 
     async def call_hot(
         self,
@@ -1240,7 +1294,7 @@ class AsyncEventsResource:
 
     async def get(self, event_id: str) -> dict[str, Any]:
         """Return a single event."""
-        return (await self._transport.request_json("GET", f"/events/{enc(event_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/events/{enc(event_id)}")
 
     async def get_runs(self, event_id: str) -> dict[str, Any]:
         """Return the runs triggered by an event."""
@@ -1257,25 +1311,27 @@ class AsyncRunsResource:
 
     async def stats(self) -> dict[str, Any]:
         """Return aggregate run statistics."""
-        return (await self._transport.request_json("GET", "/runs/stats"))["data"]
+        return await self._transport.request_data("GET", "/runs/stats")
 
     async def get(self, run_id: str) -> dict[str, Any]:
         """Return a single run."""
-        return (await self._transport.request_json("GET", f"/runs/{enc(run_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/runs/{enc(run_id)}")
 
     async def purge_calls(self, run_id: str) -> dict[str, Any]:
         """Delete the run's call traces."""
-        envelope = await self._transport.request_json("DELETE", f"/runs/{enc(run_id)}/calls")
-        return envelope["data"]
+        return await self._transport.request_data("DELETE", f"/runs/{enc(run_id)}/calls")
 
-    async def subscribe(self, run_id: str) -> AsyncIterator[StreamEvent]:
+    async def subscribe(self, run_id: str) -> AsyncGenerator[StreamEvent, None]:
         """Yield durable run snapshots until the run becomes terminal."""
-        async for event in aiter_stream(
-            self._transport,
-            "GET",
-            f"/runs/{enc(run_id)}/subscribe",
-        ):
-            yield event
+        async with aclosing(
+            aiter_stream(
+                self._transport,
+                "GET",
+                f"/runs/{enc(run_id)}/subscribe",
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def wait(
         self,
@@ -1317,16 +1373,17 @@ class AsyncEnvResource:
 
     async def get(self) -> dict[str, Any]:
         """Return environment info."""
-        return (await self._transport.request_json("GET", "/env"))["data"]
+        return await self._transport.request_data("GET", "/env")
 
-    async def subscribe(self) -> AsyncIterator[StreamEvent]:
+    async def subscribe(self) -> AsyncGenerator[StreamEvent, None]:
         """Stream environment events (requires API key credentials and pub/sub)."""
-        async for event in aiter_stream(self._transport, "GET", "/env/subscribe"):
-            yield event
+        async with aclosing(aiter_stream(self._transport, "GET", "/env/subscribe")) as events:
+            async for event in events:
+                yield event
 
     async def purge_calls(self) -> dict[str, Any]:
         """Delete every call trace in the environment."""
-        return (await self._transport.request_json("DELETE", "/env/calls"))["data"]
+        return await self._transport.request_data("DELETE", "/env/calls")
 
 
 class AsyncOrgResource:
@@ -1335,7 +1392,7 @@ class AsyncOrgResource:
 
     async def usage(self) -> dict[str, Any]:
         """Return organization usage and limits."""
-        return (await self._transport.request_json("GET", "/org/usage"))["data"]
+        return await self._transport.request_data("GET", "/org/usage")
 
 
 class AsyncStreamsResource:
@@ -1347,35 +1404,40 @@ class AsyncStreamsResource:
         stream_id: str,
         *,
         project: str | None = None,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Stream events from an existing run stream."""
-        async for event in aiter_stream(
-            self._transport,
-            "GET",
-            f"/streams/{enc(stream_id)}/subscribe",
-            params={"project": project},
-        ):
-            yield event
+        async with aclosing(
+            aiter_stream(
+                self._transport,
+                "GET",
+                f"/streams/{enc(stream_id)}/subscribe",
+                params={"project": project},
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def subscribe_post(
         self,
         stream_id: str,
         *,
         project: str | None = None,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Stream events from an existing run stream via POST."""
-        async for event in aiter_stream(
-            self._transport,
-            "POST",
-            f"/streams/{enc(stream_id)}/subscribe",
-            params={"project": project},
-        ):
-            yield event
+        async with aclosing(
+            aiter_stream(
+                self._transport,
+                "POST",
+                f"/streams/{enc(stream_id)}/subscribe",
+                params={"project": project},
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def purge_calls(self, stream_id: str) -> dict[str, Any]:
         """Delete the call traces of every run on the stream."""
-        envelope = await self._transport.request_json("DELETE", f"/streams/{enc(stream_id)}/calls")
-        return envelope["data"]
+        return await self._transport.request_data("DELETE", f"/streams/{enc(stream_id)}/calls")
 
     async def wait_for_run_result(
         self,
@@ -1386,7 +1448,7 @@ class AsyncStreamsResource:
         on_chunk: Callable[[str], None] | None = None,
         max_attempts: int = 5,
     ) -> dict[str, Any]:
-        """Wait for the run created by ``event_id``; run:fail/run:cancel raise RuntimeError.
+        """Wait for the run created by ``event_id``; run:fail/run:cancel raise HotRunError.
 
         A run with status ``pending_retry`` is not final: the wait follows the
         retry run, linked by ``origin_run_id``. A ``failed`` run whose retry
@@ -1411,7 +1473,7 @@ class AsyncStreamsResource:
         reconnect: bool = True,
         max_attempts: int = 5,
         timeout: float | None = None,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Async variant of :meth:`StreamsResource.subscribe_with_event`."""
         policy = _event_policy(timeout, max_attempts)
         if not reconnect:
@@ -1458,13 +1520,21 @@ class AsyncStreamsResource:
                     # A failure held for its retry stands; its run:fail was yielded.
                     return
                 except Exception as error:
-                    delay = policy.after_error(error, published=stream_id is not None)
+                    try:
+                        delay = policy.after_error(
+                            error, published=stream_id is not None, wake_at=runs.wake_at()
+                        )
+                    except StreamWake:
+                        return
                     if delay is None:
                         raise
                 else:
                     if stream_id is None:
                         raise RuntimeError("stream ended before event:published was received")
-                    delay = policy.after_end()
+                    try:
+                        delay = policy.after_end(wake_at=runs.wake_at())
+                    except StreamWake:
+                        return
                 await _streaming.asleep(delay)
         except TimeoutError:
             # A failure held for its retry stands at the deadline; its
@@ -1479,17 +1549,20 @@ class AsyncStreamsResource:
         project: str | None = None,
         deadline: float | None = None,
         wake: _streaming.Wake | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        async for event in aiter_stream(
-            self._transport,
-            "POST",
-            "/streams/subscribe-with-event",
-            json=dict(body),
-            params={"project": project},
-            deadline=deadline,
-            wake=wake,
-        ):
-            yield event
+    ) -> AsyncGenerator[StreamEvent, None]:
+        async with aclosing(
+            aiter_stream(
+                self._transport,
+                "POST",
+                "/streams/subscribe-with-event",
+                json=dict(body),
+                params={"project": project},
+                deadline=deadline,
+                wake=wake,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
 
 class AsyncTasksResource:
@@ -1498,16 +1571,19 @@ class AsyncTasksResource:
 
     async def get(self, task_id: str) -> dict[str, Any]:
         """Return the latest durable task snapshot."""
-        return (await self._transport.request_json("GET", f"/tasks/{enc(task_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/tasks/{enc(task_id)}")
 
-    async def subscribe(self, task_id: str) -> AsyncIterator[StreamEvent]:
+    async def subscribe(self, task_id: str) -> AsyncGenerator[StreamEvent, None]:
         """Yield durable task snapshots until the task becomes terminal."""
-        async for event in aiter_stream(
-            self._transport,
-            "GET",
-            f"/tasks/{enc(task_id)}/subscribe",
-        ):
-            yield event
+        async with aclosing(
+            aiter_stream(
+                self._transport,
+                "GET",
+                f"/tasks/{enc(task_id)}/subscribe",
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def wait(
         self,
@@ -1553,11 +1629,11 @@ class AsyncFilesResource:
 
     async def get(self, file_id: str) -> dict[str, Any]:
         """Return a single file's metadata."""
-        return (await self._transport.request_json("GET", f"/files/{enc(file_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/files/{enc(file_id)}")
 
     async def delete(self, file_id: str) -> None:
         """Delete a file."""
-        await self._transport.request_raw("DELETE", f"/files/{enc(file_id)}")
+        await self._transport.request_json("DELETE", f"/files/{enc(file_id)}")
 
     async def download(self, file_id: str) -> httpx.Response:
         """Return the HTTP response with the whole file read into memory.
@@ -1593,13 +1669,11 @@ class AsyncFilesResource:
                 **({"Content-Type": content_type} if content_type else {}),
             },
         )
-        return response.json()["data"]
+        return parse_data(response)
 
     async def initiate_upload(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Start a multipart upload."""
-        return (await self._transport.request_json("POST", "/files/uploads", json=dict(body)))[
-            "data"
-        ]
+        return await self._transport.request_data("POST", "/files/uploads", json=dict(body))
 
     async def upload_part(
         self,
@@ -1614,20 +1688,18 @@ class AsyncFilesResource:
             content=content,
             headers={"Accept": "application/json"},
         )
-        return response.json()["data"]
+        return parse_data(response)
 
     async def complete_upload(self, upload_id: str) -> dict[str, Any]:
         """Finish a multipart upload."""
-        return (
-            await self._transport.request_json(
-                "POST",
-                f"/files/uploads/{enc(upload_id)}/complete",
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "POST",
+            f"/files/uploads/{enc(upload_id)}/complete",
+        )
 
     async def abort_upload(self, upload_id: str) -> None:
         """Cancel a multipart upload."""
-        await self._transport.request_raw("DELETE", f"/files/uploads/{enc(upload_id)}")
+        await self._transport.request_json("DELETE", f"/files/uploads/{enc(upload_id)}")
 
 
 class AsyncBlobsResource:
@@ -1667,45 +1739,37 @@ class AsyncProjectsResource:
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a project."""
-        return (
-            await self._transport.request_json("POST", f"{self._prefix}/projects", json=dict(body))
-        )["data"]
+        return await self._transport.request_data(
+            "POST", f"{self._prefix}/projects", json=dict(body)
+        )
 
     async def get(self, project: str) -> dict[str, Any]:
         """Return a project by id or slug."""
-        return (
-            await self._transport.request_json("GET", f"{self._prefix}/projects/{enc(project)}")
-        )["data"]
+        return await self._transport.request_data("GET", f"{self._prefix}/projects/{enc(project)}")
 
     async def update(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Patch a project."""
-        return (
-            await self._transport.request_json(
-                "PATCH",
-                f"{self._prefix}/projects/{enc(project)}",
-                json=dict(body),
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "PATCH",
+            f"{self._prefix}/projects/{enc(project)}",
+            json=dict(body),
+        )
 
     async def delete(self, project: str) -> None:
         """Delete a project."""
-        await self._transport.request_raw("DELETE", f"{self._prefix}/projects/{enc(project)}")
+        await self._transport.request_json("DELETE", f"{self._prefix}/projects/{enc(project)}")
 
     async def activate(self, project: str) -> dict[str, Any]:
         """Activate a project."""
-        return (
-            await self._transport.request_json(
-                "POST", f"{self._prefix}/projects/{enc(project)}/activate"
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "POST", f"{self._prefix}/projects/{enc(project)}/activate"
+        )
 
     async def deactivate(self, project: str) -> dict[str, Any]:
         """Deactivate a project."""
-        return (
-            await self._transport.request_json(
-                "POST", f"{self._prefix}/projects/{enc(project)}/deactivate"
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "POST", f"{self._prefix}/projects/{enc(project)}/deactivate"
+        )
 
     async def event_handlers(self, project: str) -> dict[str, Any]:
         """Return the project's event handlers."""
@@ -1741,29 +1805,23 @@ class AsyncBuildsResource:
 
     async def get(self, project: str, build_id: str) -> dict[str, Any]:
         """Return a single build."""
-        return (
-            await self._transport.request_json(
-                "GET",
-                f"{self._prefix}/projects/{enc(project)}/builds/{enc(build_id)}",
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "GET",
+            f"{self._prefix}/projects/{enc(project)}/builds/{enc(build_id)}",
+        )
 
     async def deployed(self, project: str) -> dict[str, Any]:
         """Return the project's deployed build."""
-        return (
-            await self._transport.request_json(
-                "GET",
-                f"{self._prefix}/projects/{enc(project)}/builds/deployed",
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "GET",
+            f"{self._prefix}/projects/{enc(project)}/builds/deployed",
+        )
 
     async def live(self, project: str) -> dict[str, Any]:
         """Return the project's live build."""
-        return (
-            await self._transport.request_json(
-                "GET", f"{self._prefix}/projects/{enc(project)}/builds/live"
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "GET", f"{self._prefix}/projects/{enc(project)}/builds/live"
+        )
 
     async def upload(
         self,
@@ -1782,7 +1840,7 @@ class AsyncBuildsResource:
             files={"file": file},
             headers={"Accept": "application/json"},
         )
-        return response.json()["data"]
+        return parse_data(response)
 
     async def download(self, project: str, build_id: str) -> httpx.Response:
         """Return the HTTP response with the whole build archive read into memory.
@@ -1805,12 +1863,10 @@ class AsyncBuildsResource:
 
     async def deploy(self, project: str, build_id: str) -> dict[str, Any]:
         """Deploy a build."""
-        return (
-            await self._transport.request_json(
-                "POST",
-                f"{self._prefix}/projects/{enc(project)}/builds/{enc(build_id)}/deploy",
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "POST",
+            f"{self._prefix}/projects/{enc(project)}/builds/{enc(build_id)}/deploy",
+        )
 
 
 class AsyncContextResource:
@@ -1826,27 +1882,23 @@ class AsyncContextResource:
 
     async def create(self, project: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a context variable."""
-        return (
-            await self._transport.request_json(
-                "POST",
-                f"{self._prefix}/projects/{enc(project)}/context",
-                json=dict(body),
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "POST",
+            f"{self._prefix}/projects/{enc(project)}/context",
+            json=dict(body),
+        )
 
     async def update(self, project: str, key: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Replace a context variable."""
-        return (
-            await self._transport.request_json(
-                "PUT",
-                f"{self._prefix}/projects/{enc(project)}/context/{enc(key)}",
-                json=dict(body),
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "PUT",
+            f"{self._prefix}/projects/{enc(project)}/context/{enc(key)}",
+            json=dict(body),
+        )
 
     async def delete(self, project: str, key: str) -> None:
         """Delete a context variable."""
-        await self._transport.request_raw(
+        await self._transport.request_json(
             "DELETE",
             f"{self._prefix}/projects/{enc(project)}/context/{enc(key)}",
         )
@@ -1858,7 +1910,7 @@ class AsyncDomainsResource:
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Register a custom domain."""
-        return (await self._transport.request_json("POST", "/domains", json=dict(body)))["data"]
+        return await self._transport.request_data("POST", "/domains", json=dict(body))
 
     async def list(self) -> dict[str, Any]:
         """Return the domain list envelope."""
@@ -1866,17 +1918,15 @@ class AsyncDomainsResource:
 
     async def get(self, domain_id: str) -> dict[str, Any]:
         """Return a single domain."""
-        return (await self._transport.request_json("GET", f"/domains/{enc(domain_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/domains/{enc(domain_id)}")
 
     async def delete(self, domain_id: str) -> None:
         """Delete a domain."""
-        await self._transport.request_raw("DELETE", f"/domains/{enc(domain_id)}")
+        await self._transport.request_json("DELETE", f"/domains/{enc(domain_id)}")
 
     async def verify(self, domain_id: str) -> dict[str, Any]:
         """Trigger domain verification."""
-        return (await self._transport.request_json("POST", f"/domains/{enc(domain_id)}/verify"))[
-            "data"
-        ]
+        return await self._transport.request_data("POST", f"/domains/{enc(domain_id)}/verify")
 
 
 class AsyncSessionsResource:
@@ -1885,7 +1935,7 @@ class AsyncSessionsResource:
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a scoped session."""
-        return (await self._transport.request_json("POST", "/sessions", json=dict(body)))["data"]
+        return await self._transport.request_data("POST", "/sessions", json=dict(body))
 
     async def list(self, **query: Any) -> dict[str, Any]:
         """Return the session list envelope."""
@@ -1893,11 +1943,11 @@ class AsyncSessionsResource:
 
     async def revoke(self, session_id: str) -> None:
         """Revoke one session."""
-        await self._transport.request_raw("DELETE", f"/sessions/{enc(session_id)}")
+        await self._transport.request_json("DELETE", f"/sessions/{enc(session_id)}")
 
     async def revoke_all(self) -> dict[str, Any]:
         """Revoke every session."""
-        return (await self._transport.request_json("DELETE", "/sessions"))["data"]
+        return await self._transport.request_data("DELETE", "/sessions")
 
 
 class AsyncServiceKeysResource:
@@ -1906,9 +1956,7 @@ class AsyncServiceKeysResource:
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a scoped service key."""
-        return (await self._transport.request_json("POST", "/service-keys", json=dict(body)))[
-            "data"
-        ]
+        return await self._transport.request_data("POST", "/service-keys", json=dict(body))
 
     async def list(self, **query: Any) -> dict[str, Any]:
         """Return the service key list envelope."""
@@ -1916,30 +1964,26 @@ class AsyncServiceKeysResource:
 
     async def get(self, service_key_id: str) -> dict[str, Any]:
         """Return a single service key."""
-        return (
-            await self._transport.request_json(
-                "GET",
-                f"/service-keys/{enc(service_key_id)}",
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "GET",
+            f"/service-keys/{enc(service_key_id)}",
+        )
 
     async def update(self, service_key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Patch a service key."""
-        return (
-            await self._transport.request_json(
-                "PATCH",
-                f"/service-keys/{enc(service_key_id)}",
-                json=dict(body),
-            )
-        )["data"]
+        return await self._transport.request_data(
+            "PATCH",
+            f"/service-keys/{enc(service_key_id)}",
+            json=dict(body),
+        )
 
     async def revoke(self, service_key_id: str) -> None:
         """Revoke one service key."""
-        await self._transport.request_raw("DELETE", f"/service-keys/{enc(service_key_id)}")
+        await self._transport.request_json("DELETE", f"/service-keys/{enc(service_key_id)}")
 
     async def revoke_all(self) -> dict[str, Any]:
         """Revoke every service key."""
-        return (await self._transport.request_json("DELETE", "/service-keys"))["data"]
+        return await self._transport.request_data("DELETE", "/service-keys")
 
 
 class AsyncOrgEnv:
@@ -1966,31 +2010,27 @@ class AsyncOrgsResource:
 
     async def create(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create a sub-org with its default environment; see :meth:`OrgsResource.create`."""
-        return (await self._transport.request_json("POST", "/orgs", json=dict(body)))["data"]
+        return await self._transport.request_data("POST", "/orgs", json=dict(body))
 
     async def get(self, org_id: str) -> dict[str, Any]:
         """Return one organization."""
-        return (await self._transport.request_json("GET", f"/orgs/{enc(org_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/orgs/{enc(org_id)}")
 
     async def update(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Set a sub-org's ``state``: ``active``, ``suspended`` or ``archived``. Returns the org."""
-        envelope = await self._transport.request_json(
-            "PATCH", f"/orgs/{enc(org_id)}", json=dict(body)
-        )
-        return envelope["data"]
+        return await self._transport.request_data("PATCH", f"/orgs/{enc(org_id)}", json=dict(body))
 
     async def usage(self, org_id: str) -> dict[str, Any]:
         """Return usage across the parent organization and its sub-orgs; pass the parent's ID."""
-        return (await self._transport.request_json("GET", f"/orgs/{enc(org_id)}/usage"))["data"]
+        return await self._transport.request_data("GET", f"/orgs/{enc(org_id)}/usage")
 
     async def purge_calls(self, org_id: str, *, include_sub_orgs: bool = False) -> dict[str, Any]:
         """Delete every call trace in the org's environments (and its sub-organizations')."""
-        envelope = await self._transport.request_json(
+        return await self._transport.request_data(
             "DELETE",
             f"/orgs/{enc(org_id)}/calls",
             params={"include_sub_orgs": "true" if include_sub_orgs else None},
         )
-        return envelope["data"]
 
     async def list_envs(self, org_id: str) -> dict[str, Any]:
         """Return the environment list envelope for an org."""
@@ -1998,17 +2038,13 @@ class AsyncOrgsResource:
 
     async def create_env(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Create an environment; idempotent by exact ``name`` within the org."""
-        envelope = await self._transport.request_json(
+        return await self._transport.request_data(
             "POST", f"/orgs/{enc(org_id)}/envs", json=dict(body)
         )
-        return envelope["data"]
 
     async def get_env(self, org_id: str, env_id: str) -> dict[str, Any]:
         """Return one environment."""
-        envelope = await self._transport.request_json(
-            "GET", f"/orgs/{enc(org_id)}/envs/{enc(env_id)}"
-        )
-        return envelope["data"]
+        return await self._transport.request_data("GET", f"/orgs/{enc(org_id)}/envs/{enc(env_id)}")
 
     async def list_api_keys(self, org_id: str, **query: Any) -> dict[str, Any]:
         """Return the list envelope of the org's own org API keys."""
@@ -2018,10 +2054,9 @@ class AsyncOrgsResource:
 
     async def create_api_key(self, org_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Mint an org API key; the response's ``token`` is returned only once."""
-        envelope = await self._transport.request_json(
+        return await self._transport.request_data(
             "POST", f"/orgs/{enc(org_id)}/api-keys", json=dict(body)
         )
-        return envelope["data"]
 
     async def list_env_api_keys(self, org_id: str, env_id: str, **query: Any) -> dict[str, Any]:
         """Return the list envelope of an environment's API keys."""
@@ -2033,12 +2068,11 @@ class AsyncOrgsResource:
         self, org_id: str, env_id: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Mint an environment API key; the response's ``token`` is returned only once."""
-        envelope = await self._transport.request_json(
+        return await self._transport.request_data(
             "POST",
             f"/orgs/{enc(org_id)}/envs/{enc(env_id)}/api-keys",
             json=dict(body),
         )
-        return envelope["data"]
 
     def env(self, org_id: str, env_id: str) -> AsyncOrgEnv:
         """Projects, builds and context in one of the org's environments."""
@@ -2053,23 +2087,21 @@ class AsyncApiKeysResource:
 
     async def get(self, key_id: str) -> dict[str, Any]:
         """Return one API key (never its secret)."""
-        return (await self._transport.request_json("GET", f"/api-keys/{enc(key_id)}"))["data"]
+        return await self._transport.request_data("GET", f"/api-keys/{enc(key_id)}")
 
     async def update(self, key_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Replace a key's ``permissions``; they must fit inside the caller's own."""
-        envelope = await self._transport.request_json(
+        return await self._transport.request_data(
             "PATCH", f"/api-keys/{enc(key_id)}", json=dict(body)
         )
-        return envelope["data"]
 
     async def revoke(self, key_id: str) -> None:
         """Revoke a key. Everything it issued stops on its next request."""
-        await self._transport.request_raw("DELETE", f"/api-keys/{enc(key_id)}")
+        await self._transport.request_json("DELETE", f"/api-keys/{enc(key_id)}")
 
     async def rotate(self, key_id: str, *, overlap_seconds: int | None = None) -> dict[str, Any]:
         """Issue a new secret for the same key; see :meth:`ApiKeysResource.rotate`."""
         body = {} if overlap_seconds is None else {"overlap_seconds": overlap_seconds}
-        envelope = await self._transport.request_json(
+        return await self._transport.request_data(
             "POST", f"/api-keys/{enc(key_id)}/rotate", json=body
         )
-        return envelope["data"]

@@ -15,7 +15,8 @@ This repo contains the Python SDK for the Hot Dev API.
 ```bash
 python -m pip install -e ".[dev]"
 ruff check .
-ruff format --check src tests
+ruff format --check src tests integration/suborg_fixture.py
+mypy src
 pytest
 python -m build
 ```
@@ -23,15 +24,16 @@ python -m build
 ## CI and Releases
 
 - CI runs on pushes and pull requests to `main`: install, lint (`ruff check`,
-  `ruff format --check`), test (`pytest`), and build (`python -m build`) on
-  Python 3.10–3.15. Dev tools are pinned in `pyproject.toml`; Dependabot bumps
-  them and the Actions weekly.
+  `ruff format --check`), typecheck (`mypy src` on Python 3.13), test (`pytest`),
+  and build (`python -m build`) on Python 3.10–3.15. Dev tools are pinned in
+  `pyproject.toml`; Dependabot bumps them and the Actions weekly.
 - The "Org API isolation (PostgreSQL)" job builds the hot revision in
   `integration/hot-server.ref` (keep the CI checkout `ref:` identical) and runs
   `integration/suborg_fixture.py` against restricted PostgreSQL roles. A weekly
   scheduled run builds hot `main` instead, to catch API drift.
 - PyPI releases run from tags named `v<version>` matching the
-  `pyproject.toml` version.
+  `pyproject.toml` version (verified in `release.yml` along with lint, typecheck,
+  and tests before building/publishing).
 - Publishing uses PyPI Trusted Publishing via OIDC against the `pypi` GitHub
   Actions environment — no PyPI token secret is required, but the project
   publisher must be configured on PyPI before the first tag push.
@@ -39,8 +41,8 @@ python -m build
 Release flow:
 
 ```bash
-# Bump the version in pyproject.toml.
-git add pyproject.toml
+# Bump the version in pyproject.toml and src/hot/_version.py.
+git add pyproject.toml src/hot/_version.py
 git commit -m "release v<version>"
 git tag v<version>
 git push origin main v<version>
@@ -68,7 +70,7 @@ All five SDK repos (hot-js, hot-python, hot-go, hot-rust, hot-java) release in
 lockstep. Checklist for a coordinated release:
 
 1. Bump every SDK's version: js `npm version` (syncs src/version.ts via the
-   `version` script), python pyproject.toml, rust Cargo.toml, java
+   `version` script), python pyproject.toml + src/hot/_version.py, rust Cargo.toml, java
    gradle.properties + README snippets, go `Version` constant in client.go.
 2. Regenerate each repo's openapi-operations fixture from a current `hot dev`
    and reconcile the coverage tables.

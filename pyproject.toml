@@ -20,8 +20,20 @@ keywords = [
   "agents",
   "streaming",
 ]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
 dependencies = [
-  "httpx>=0.28",
+  "httpx>=0.28,<1.0",
 ]
 
 [project.urls]
@@ -33,12 +45,31 @@ Issues = "https://github.com/hot-dev/hot-python/issues"
 # Pinned so CI and releases use reviewed tool versions; Dependabot bumps them.
 dev = [
   "build==1.6.1",
+  "mypy==1.15.0",
   "pytest==9.2.0",
   "ruff==0.17.6",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hot"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/hot",
+  "README.md",
+  "LICENSE",
+  "NOTICE",
+  "pyproject.toml",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
 
 [tool.ruff]
 line-length = 100

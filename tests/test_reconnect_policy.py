@@ -207,11 +207,15 @@ def test_subscribe_with_event_stops_on_permanent_reconnect_error(sleeps):
 
 
 def test_subscribe_with_event_retries_transient_reconnect_errors(sleeps):
-    script = Script(ok(PUBLISHED), error(503), error(429, "1"), ok(stop()))
+    script = Script(ok(PUBLISHED, COMPLETE), error(503), error(429, "1"), ok(stop()))
     with client(script) as hot:
         events = list(hot.streams.subscribe_with_event({"event_type": "x", "event_data": {}}))
-    assert [event["type"] for event in events] == ["event:published", "run:stop"]
-    # The first connection delivered event:published, so it reconnects at once.
+    assert [event["type"] for event in events] == [
+        "event:published",
+        "stream:complete",
+        "run:stop",
+    ]
+    # Explicit stream:complete rollover reconnects immediately.
     assert sleeps[0] == 0.0 and len(sleeps) == 3 and sleeps[2] >= 1
 
 
@@ -270,7 +274,9 @@ def test_async_waiters_follow_the_same_policy(sleeps):
         async with aclient(script) as hot:
             assert (await hot.runs.wait("r1", max_attempts=1))["status"] == "succeeded"
 
-        script = Script(ok(PUBLISHED), error(503), *[ok(COMPLETE) for _ in range(4)], ok(stop()))
+        script = Script(
+            ok(PUBLISHED, COMPLETE), error(503), *[ok(COMPLETE) for _ in range(4)], ok(stop())
+        )
         async with aclient(script) as hot:
             events = [
                 event
@@ -280,7 +286,7 @@ def test_async_waiters_follow_the_same_policy(sleeps):
             ]
         assert events[-1]["type"] == "run:stop"
 
-        script = Script(ok(PUBLISHED), ok(COMPLETE), error(404))
+        script = Script(ok(PUBLISHED, COMPLETE), ok(COMPLETE), error(404))
         async with aclient(script) as hot:
             with pytest.raises(HotApiError) as raised:
                 await hot.events.call_hot("::f/g")
@@ -293,3 +299,70 @@ def test_async_waiters_follow_the_same_policy(sleeps):
 
     asyncio.run(scenario())
     assert sleeps[0] > 0
+
+
+def test_premature_eof_after_snapshot_backs_off_and_respects_max_attempts(sleeps):
+    # Without stream:complete, clean EOF after an initial snapshot must NOT spin at 0ms.
+    script = Script(ok(run_update("running")), ok(run_update("running")), ok(run_update("running")))
+    with client(script) as hot:
+        with pytest.raises(RuntimeError, match="Run subscription ended"):
+            hot.runs.wait("r1", max_attempts=2)
+    assert len(script.calls) == 3
+    assert len(sleeps) == 2 and all(delay > 0 for delay in sleeps)
+
+
+def test_premature_eof_in_subscribe_with_event_backs_off_and_stops(sleeps):
+    script = Script(ok(PUBLISHED), ok(), ok())
+    with client(script) as hot:
+        with pytest.raises(RuntimeError, match="stream ended"):
+            list(hot.streams.subscribe_with_event({"event_type": "x"}, max_attempts=2))
+    assert len(script.calls) == 3
+    assert len(sleeps) == 2 and all(delay > 0 for delay in sleeps)
+
+
+def test_backoff_respects_held_failure_wake_at(sleeps):
+    held = {
+        "type": "run:fail",
+        "run": run("failed", retry_attempt=1, result="first attempt"),
+    }
+    # Stream delivers a held failure (5 s grace) and rolls over, then reconnect hits 503
+    # Retry-After: 30. Backoff must NOT sleep 30 s when wake_at expires in 5 s.
+    script = Script(ok(PUBLISHED, held, COMPLETE), error(503, retry_after="30"))
+    with client(script) as hot:
+        with pytest.raises(RuntimeError, match="first attempt"):
+            hot.events.call_hot("::f/g", timeout=60)
+    assert sleeps == [0.0]
+
+    # Same for subscribe_with_event (yields the run:fail and ends cleanly without sleeping 30 s).
+    sleeps.clear()
+    script = Script(ok(PUBLISHED, held, COMPLETE), error(503, retry_after="30"))
+    with client(script) as hot:
+        events = list(hot.streams.subscribe_with_event({"event_type": "x"}, timeout=60))
+    assert [e["type"] for e in events] == ["event:published", "run:fail", "stream:complete"]
+    assert sleeps == [0.0]
+
+    # Async variant.
+    sleeps.clear()
+
+    async def scenario():
+        async_script = Script(ok(PUBLISHED, held, COMPLETE), error(503, retry_after="30"))
+        async with aclient(async_script) as hot:
+            with pytest.raises(RuntimeError, match="first attempt"):
+                await hot.events.call_hot("::f/g", timeout=60)
+
+    asyncio.run(scenario())
+    assert sleeps == [0.0]
+
+
+def test_stream_timeout_raises_stream_wake_when_wake_passed():
+    now = time.monotonic()
+    with pytest.raises(_streaming.StreamWake):
+        _streaming._stream_timeout(deadline=now + 60.0, wake=lambda: now - 0.1)
+    with pytest.raises(_streaming.StreamDeadline):
+        _streaming._stream_timeout(deadline=now - 0.1, wake=None)
+
+
+def test_backoff_delay_caps_retry_after_at_30s():
+    assert _streaming.backoff_delay(1, retry_after=120) == 30.0
+    assert _streaming.backoff_delay(1, retry_after=0) <= 0.5
+    assert _streaming.backoff_delay(1, retry_after=-5) <= 0.5

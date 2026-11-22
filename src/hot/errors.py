@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import json
+import math
 import re
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 
 KeyScope = Literal["org", "env"]
 
 _ORG_ROUTE = re.compile(r"/v1/(?:orgs|api-keys)(?:/|$)")
+_MAX_ERROR_TEXT_LEN = 4096
+
+
+def truncate_error_text(text: str, limit: int = _MAX_ERROR_TEXT_LEN) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... (truncated)"
 
 
 class HotApiError(Exception):
@@ -50,19 +62,20 @@ class HotTaskError(Exception):
 
     def __init__(self, task: dict[str, Any]) -> None:
         result = task.get("result")
-        message = _result_message(result) or f"Task {task.get('status', 'failed')}"
+        status = task.get("status") or "failed"
+        message = _result_message(result) or f"Task {status}"
         super().__init__(message)
         self.task = task
 
 
-class HotRunError(Exception):
+class HotRunError(RuntimeError):
     """Raised when a waited run reaches a non-success terminal state."""
 
-    def __init__(self, run: dict[str, Any]) -> None:
+    def __init__(self, run: dict[str, Any], *, message: str | None = None) -> None:
         result = run.get("result")
-        status = run.get("status", "failed")
-        message = _result_message(result) or f"Run {status}"
-        super().__init__(message)
+        status = run.get("status") or "failed"
+        resolved = message or _result_message(result) or f"Run {status}"
+        super().__init__(resolved)
         self.run = run
 
 
@@ -85,9 +98,7 @@ def parse_api_error(
     path: str | None = None,
 ) -> HotApiError:
     try:
-        import json
-
-        parsed = json.loads(text) if text else {}
+        parsed: Any = json.loads(text) if text else {}
     except ValueError:
         parsed = {}
 
@@ -119,9 +130,10 @@ def parse_api_error(
             error=error,
         )
 
+    message = truncate_error_text(text) if text else f"Hot API error ({status_code})"
     return HotApiError(
         status_code=status_code,
-        message=text or f"Hot API error ({status_code})",
+        message=message,
         retry_after=_retry_after(None, headers),
         headers=headers,
     )
@@ -144,13 +156,30 @@ def _required_scope(path: str | None, message: str) -> KeyScope:
     return "org" if "needs an org API key" in message else "env"
 
 
-def _retry_after(value: Any, headers: dict[str, str]) -> int | None:
-    if isinstance(value, int):
-        return value
-    header_value = headers.get("retry-after") or headers.get("Retry-After")
+def _retry_after(value: Any, headers: Mapping[str, str]) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value >= 0 else None
+
+    header_value: str | None = None
+    for key, raw in headers.items():
+        if key.lower() == "retry-after":
+            header_value = raw.strip()
+            break
     if not header_value:
         return None
+
     try:
-        return int(header_value)
+        seconds = int(header_value)
     except ValueError:
+        seconds = None
+    if seconds is not None:
+        return seconds if seconds >= 0 else None
+
+    try:
+        target = parsedate_to_datetime(header_value)
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    delta = (target - datetime.now(timezone.utc)).total_seconds()
+    return max(0, math.ceil(delta))
