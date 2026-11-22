@@ -9,7 +9,8 @@ import time
 import httpx
 import pytest
 
-from hot import AsyncHotClient, HotClient, _streaming
+from hot import AsyncHotClient, HotClient, HotRunError, _streaming
+from hot.resources import _RunEventDedupe
 
 PUBLISHED = {"type": "event:published", "stream_id": "s1", "event_id": "e1"}
 
@@ -344,3 +345,138 @@ def test_our_plain_failure_still_fails_at_once_with_a_task_run(task_first):
     with pytest.raises(RuntimeError, match="boom"):
         asyncio.run(scenario())
     assert time.monotonic() - started < 1
+
+
+def test_run_fail_retry_run_id_correlates_retry_immediately():
+    # Top-level retry_run_id on run:fail correlates r2 immediately — flushing held chunks,
+    # emitting subsequent chunks before r2's run:start, and matching r2 even without origin_run_id.
+    fail_with_retry_id = {
+        "type": "run:fail",
+        "retry_run_id": "r2",
+        "run": {
+            "run_id": "r1",
+            "event_id": "e1",
+            "status": "failed",
+            "run_type": "event",
+            "retry_attempt": 1,
+            "result": "first failed",
+        },
+    }
+    retry_stop_no_origin = run(
+        "run:stop", "r2", "succeeded", event_id="e9", run_type="event", result="retried-ok"
+    )
+    stream = sse(
+        PUBLISHED,
+        chunk("r2", "early-"),
+        fail_with_retry_id,
+        chunk("r2", "after"),
+        retry_stop_no_origin,
+    )
+    hot, ahot = serve(stream, stream)
+    chunks: list[str] = []
+    with hot:
+        assert hot.events.call_hot("::f/g", on_chunk=chunks.append) == "retried-ok"
+    assert chunks == ["early-", "after"]
+
+    async def scenario():
+        received: list[str] = []
+        async with ahot:
+            result = await ahot.events.call_hot("::f/g", on_chunk=received.append)
+        return result, received
+
+    assert asyncio.run(scenario()) == ("retried-ok", ["early-", "after"])
+
+
+def test_run_fail_retry_run_id_final_failure_of_retry_raises_hot_run_error():
+    fail_with_retry_id = {
+        "type": "run:fail",
+        "retry_run_id": "r2",
+        "run": {
+            "run_id": "r1",
+            "event_id": "e1",
+            "status": "pending_retry",
+            "run_type": "event",
+            "retry_attempt": 1,
+        },
+    }
+    retry_final_fail = run(
+        "run:fail",
+        "r2",
+        "failed",
+        event_id="e9",
+        run_type="event",
+        retry_attempt=1,
+        result="still broken",
+    )
+    hot, _ = serve(sse(PUBLISHED, fail_with_retry_id, retry_final_fail))
+    started = time.monotonic()
+    with hot:
+        with pytest.raises(HotRunError, match="still broken") as exc:
+            hot.events.call_hot("::f/g")
+    assert isinstance(exc.value, RuntimeError)
+    assert exc.value.run["run_id"] == "r2"
+    assert time.monotonic() - started < 1
+
+
+def test_run_event_dedupe_does_not_block_final_after_pending_retry():
+    dedupe = _RunEventDedupe()
+    pending = run("run:fail", "r1", "pending_retry", retry_attempt=1)
+    final_fail = run("run:fail", "r1", "failed", retry_attempt=0, result="final boom")
+    final_cancel = run("run:cancel", "r2", "cancelled")
+
+    assert dedupe.replayed(pending) is False
+    # Replayed pending_retry IS deduped.
+    assert dedupe.replayed(pending) is True
+    # Subsequent final failed event for the SAME run_id is NOT blocked!
+    assert dedupe.replayed(final_fail) is False
+    assert dedupe.replayed(final_fail) is True
+
+    # Same for pending_retry followed by run:cancel.
+    assert dedupe.replayed(run("run:fail", "r2", "pending_retry")) is False
+    assert dedupe.replayed(final_cancel) is False
+
+    # End-to-end through subscribe_with_event (sync & async): pending_retry then cancel ends.
+    events_stream = sse(
+        PUBLISHED,
+        run("run:fail", "r1", "pending_retry"),
+        run("run:cancel", "r1", "cancelled"),
+    )
+    hot, ahot = serve(events_stream, events_stream)
+    with hot:
+        seen = list(hot.streams.subscribe_with_event({"event_type": "x"}))
+    assert [e["type"] for e in seen] == ["event:published", "run:fail", "run:cancel"]
+
+    async def scenario():
+        async with ahot:
+            return [e async for e in ahot.streams.subscribe_with_event({"event_type": "x"})]
+
+    assert [e["type"] for e in asyncio.run(scenario())] == [
+        "event:published",
+        "run:fail",
+        "run:cancel",
+    ]
+
+
+def test_correlator_and_dedupe_memory_caps(monkeypatch):
+    monkeypatch.setattr(_streaming, "_MAX_FOREIGN_RUNS", 3)
+    monkeypatch.setattr(_streaming, "_MAX_ORPHAN_EVENTS", 3)
+
+    correlator = _streaming.RunCorrelator("e1")
+    for i in range(10):
+        correlator.observe(run("run:start", f"foreign-{i}", "running", event_id=f"other-{i}"))
+        correlator.observe(
+            run(
+                "run:start",
+                f"orphan-{i}",
+                "running",
+                event_id=f"other-{i}",
+                origin_run_id=f"unknown-origin-{i}",
+            )
+        )
+    assert len(correlator._foreign) <= 3
+    assert correlator._orphan_count <= 3
+
+    dedupe = _RunEventDedupe(max_entries=3)
+    for i in range(10):
+        dedupe.replayed(run("run:start", f"r-{i}", "running"))
+    assert len(dedupe._seen) <= 3

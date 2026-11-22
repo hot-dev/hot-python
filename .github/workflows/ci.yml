@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: "23 6 * * 1"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -17,6 +21,7 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -45,7 +52,11 @@ jobs:
       - name: Lint
         run: |
           ruff check .
-          ruff format --check src tests
+          ruff format --check src tests integration/suborg_fixture.py
+
+      - name: Typecheck
+        if: matrix.python-version == '3.13'
+        run: mypy src
 
       - name: Test
         run: pytest
@@ -56,9 +67,12 @@ jobs:
   integration:
     name: Integration (hot dev)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -90,6 +104,8 @@ jobs:
     steps:
       - name: Checkout SDK
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # A released CLI may lag these API changes. Pin the tested server source
       # separately so its schema, runtime qualification, and OpenAPI agree.
@@ -127,7 +143,7 @@ jobs:
       - name: Install server Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
 
       - name: Cache matching server build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -144,6 +160,7 @@ jobs:
           curl -fsSL --retry 3 \
             https://github.com/tailwindlabs/tailwindcss/releases/download/v4.3.0/tailwindcss-linux-x64 \
             -o "$RUNNER_TEMP/hot-sdk-bin/tailwindcss"
+          echo "73f0e5459054e5cfaa8ab6f3b940f3fbe0f13cc7fd83bc24e7c655033c203400  $RUNNER_TEMP/hot-sdk-bin/tailwindcss" | sha256sum --check -
           chmod +x "$RUNNER_TEMP/hot-sdk-bin/tailwindcss"
           echo "$RUNNER_TEMP/hot-sdk-bin" >> "$GITHUB_PATH"
 

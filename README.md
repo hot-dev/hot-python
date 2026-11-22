@@ -100,14 +100,17 @@ and `streams.subscribe_with_event` share one reconnect policy:
   cross the deadline raises `TimeoutError` instead.
 - `max_attempts` (default 5) counts consecutive failed connections. The API
   closes every subscription 5 minutes after it opens, with `stream:complete`;
-  those rollovers reconnect at once and do not count, so long runs can be
-  awaited for as long as `timeout` allows.
+  explicit `stream:complete` rollovers reconnect at once and do not count, so
+  long runs can be awaited for as long as `timeout` allows. Unexpected premature
+  stream closes without `stream:complete` back off and count against
+  `max_attempts`.
 - A run with status `pending_retry` is not final, whatever the event: the
-  waiter follows the handler's retry run (linked by `origin_run_id`). Hot can
-  replay a retried attempt as `run:fail` with status `failed` before the retry
-  run exists; when its `retry_attempt` shows a scheduled retry, the waiter
-  holds that failure for 5 seconds (or until `timeout`) and raises it only if
-  no retry run appears. `subscribe_with_event` yields that `run:fail` and ends
+  waiter follows the handler's retry run (linked by `retry_run_id` or
+  `origin_run_id`). Hot can replay a retried attempt as `run:fail` with status
+  `failed` before the retry run exists; when its `retry_attempt` shows a
+  scheduled retry, the waiter holds that failure for 5 seconds (or until
+  `timeout`) and raises `HotRunError` (a `RuntimeError` subclass) only if no
+  retry run appears. `subscribe_with_event` yields that `run:fail` and ends
   after the same grace.
 - `on_chunk` receives `stream:data` text in order, including chunks the server
   delivers before `run:start`.
@@ -164,18 +167,28 @@ every runtime resource.
 
 ### Retries
 
-JSON requests are retried automatically (at most twice) when the API responds
-429 with a `retry_after`, and idempotent requests (GET, PUT, DELETE) also on
-502, 503 and 504. Other errors are raised as-is. Raw requests are never
-retried; waiters follow the reconnect policy above.
+JSON requests are retried automatically (at most twice, bounded by the client's
+configured read timeout) when the API responds:
+
+- `429` with a `retry_after` (including `0`, integer seconds, or HTTP-date),
+- `502`, `503`, or `504` on idempotent requests (`GET`, `HEAD`, `PUT`, `DELETE`),
+- `503` with error code `event_publish_in_progress` on `POST` (for example,
+  concurrent retries of `events.publish` with the same client-supplied
+  `event_id`).
+
+Other errors (including `409 event_id_conflict` when an `event_id` is reused
+with different parameters) are raised as-is. Raw requests (`request_raw`,
+uploads, downloads) are never retried; waiters follow the reconnect policy
+above.
 
 ## Resources
 
-`HotClient` mirrors the Hot API v1 resources:
+`HotClient` mirrors the Hot API resources:
 
-- `hot.events` — publish, list, get, inspect event runs, and call Hot functions with `call_hot(fn, args)`
+- `hot.status()` — public, unauthenticated server health check (`GET /status`; does not send `Authorization`)
+- `hot.events` — publish (pass an optional `event_id` for idempotent retries; conflicting reuse returns `409 event_id_conflict`), list, get, inspect event runs, and call Hot functions with `call_hot(fn, args)`
 - `hot.streams` — subscribe to run and task updates, wait for run results, and publish events atomically (reconnects automatically across the 5-minute SSE timeout; pass `reconnect=False` to opt out)
-- `hot.runs` — list, inspect, subscribe to, and wait for durable runs
+- `hot.runs` — list (filter by `status`, `type`, `time_range`, `project_id`, `stream_id`, `function`, `limit`, `offset`), inspect, subscribe to, and wait for durable runs
 - `hot.tasks` — get, subscribe to, and wait for durable background tasks
 - `hot.files` — upload, download (`download_stream` for large files), list, and delete files (including multipart uploads)
 - `hot.projects` — create, list, update, activate, deactivate, and delete projects
@@ -188,10 +201,12 @@ retried; waiters follow the reconnect policy above.
 - `hot.org` — view the environment's usage and limits
 - `hot.env` — read environment info, subscribe to environment events, and purge call traces
 - `hot.orgs` — with an org API key: sub-organizations, their environments and API keys, account usage, and `orgs.env(org_id, env_id)` for projects, builds and context in an environment
-- `hot.api_keys` — with an org API key: get, narrow, rotate, and revoke API keys it issued
+- `hot.api_keys` — with an org API key: get, narrow, rotate, and revoke API keys it issued (`status` can be `active`, `revoked`, `disabled`, `expired`, `issuer_inactive`, or `suspended`)
 
-Use `hot.request(...)` or `hot.request_raw(...)` as an escape hatch for API
-endpoints that do not yet have a resource helper.
+Use `hot.request(...)` or `hot.request_raw(...)` as an escape hatch for `/v1`
+API endpoints that do not yet have a resource helper. Paths are resolved under
+`/v1` automatically (pass `"/runs"` or `"runs"`, not `"/v1/runs"`); use
+`hot.status()` for the unversioned `GET /status` route.
 
 `hot.env.subscribe()` requires API key credentials and a live API pub/sub
 backend; local API servers without pub/sub return a 503. `subscribe_with_event`
@@ -203,7 +218,9 @@ not end the iterator.
 
 Without `timeout` or `client`, requests time out after 60 s per read and 10 s
 to connect; pass `timeout=httpx.Timeout(None)` to disable that. Streams and
-waiters set their own timeouts.
+waiters set their own timeouts. Note that `timeout=` is ignored when you pass a
+custom `client=` — configure timeouts on your `httpx.Client` /
+`httpx.AsyncClient` instead.
 
 `HotClient` and `AsyncHotClient` accept an `httpx.Client` (or
 `httpx.AsyncClient`) via the `client=` argument. Use this to configure retries,

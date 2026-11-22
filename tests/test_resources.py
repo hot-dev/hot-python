@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 
 import httpx
+import pytest
 
 from hot import AsyncHotClient, HotClient
+from hot.resources import enc, enc_path
 
 
 def test_core_resource_methods_route_to_expected_api_paths():
@@ -151,3 +154,191 @@ def test_async_blobs_download_returns_the_raw_bytes():
         ("GET", "/v1/blobs/blob_123/download", "/v1/blobs/blob_123/download"),
         ("GET", "/v1/blobs/blob/123/download", "/v1/blobs/blob%2F123/download"),
     ]
+
+
+def test_path_segment_validation_rejects_traversal_and_empty_before_http():
+    def forbid_http(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Unexpected HTTP call: {request.method} {request.url}")
+
+    with HotClient(
+        token="test-token",
+        base_url="https://api.example.test",
+        client=httpx.Client(transport=httpx.MockTransport(forbid_http)),
+    ) as hot:
+        with pytest.raises(ValueError):
+            hot.sessions.revoke(".")
+        with pytest.raises(ValueError):
+            hot.service_keys.revoke(".")
+        with pytest.raises(ValueError):
+            hot.context.delete("p1", "..")
+        with pytest.raises(ValueError):
+            hot.projects.get("")
+        with pytest.raises(ValueError):
+            hot.files.upload("../secret", b"x")
+        with pytest.raises(ValueError):
+            hot.files.upload("/../secret", b"x")
+        with pytest.raises(ValueError):
+            hot.files.upload("a/./b", b"x")
+        with pytest.raises(ValueError):
+            hot.files.upload("a//b", b"x")
+        with pytest.raises(ValueError):
+            hot.files.upload("a/b/", b"x")
+        with pytest.raises(ValueError):
+            hot.files.upload("/", b"x")
+        with pytest.raises(ValueError):
+            hot.files.upload("", b"x")
+
+    async def async_scenario() -> None:
+        async with AsyncHotClient(
+            token="test-token",
+            base_url="https://api.example.test",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(forbid_http)),
+        ) as ahot:
+            with pytest.raises(ValueError):
+                await ahot.sessions.revoke(".")
+            with pytest.raises(ValueError):
+                await ahot.service_keys.revoke(".")
+            with pytest.raises(ValueError):
+                await ahot.context.delete("p1", "..")
+            with pytest.raises(ValueError):
+                await ahot.projects.get("")
+            with pytest.raises(ValueError):
+                await ahot.files.upload("../secret", b"x")
+
+    asyncio.run(async_scenario())
+
+    assert enc("ok/seg") == "ok%2Fseg"
+    assert enc_path("/notes/today.txt") == "notes/today.txt"
+    assert enc_path("notes/today.txt") == "notes/today.txt"
+
+
+def test_async_core_resource_methods_route_to_expected_api_paths():
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "DELETE" and not request.url.path.endswith(
+            ("/sessions", "/service-keys", "/calls")
+        ):
+            return httpx.Response(204)
+        if request.url.path.endswith("/download"):
+            return httpx.Response(200, content=b"download")
+        return httpx.Response(200, json={"data": {}, "meta": {}})
+
+    async def scenario() -> None:
+        async with AsyncHotClient(
+            token="test-token",
+            base_url="https://api.example.test",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        ) as hot:
+            await hot.events.publish({"event_type": "x", "event_data": {}})
+            await hot.events.list()
+            await hot.events.get("e1")
+            await hot.events.get_runs("e1")
+            await hot.runs.list(status="succeeded", time_range="P7D")
+            await hot.runs.stats()
+            await hot.runs.get("r1")
+            await hot.tasks.get("t1")
+            await hot.env.get()
+            await hot.org.usage()
+            await hot.projects.create({"name": "Demo"})
+            await hot.projects.get("demo")
+            await hot.projects.update("demo", {"name": "Demo"})
+            await hot.projects.delete("demo")
+            await hot.projects.activate("demo")
+            await hot.projects.deactivate("demo")
+            await hot.projects.event_handlers("demo")
+            await hot.projects.schedules("demo")
+            await hot.builds.list()
+            await hot.builds.list_for_project("demo")
+            await hot.builds.get("demo", "b1")
+            await hot.builds.deployed("demo")
+            await hot.builds.live("demo")
+            await hot.builds.download("demo", "b1")
+            await hot.builds.deploy("demo", "b1")
+            await hot.context.list("demo")
+            await hot.context.create("demo", {"key": "K", "value": "V"})
+            await hot.context.update("demo", "K", {"value": "V2"})
+            await hot.context.delete("demo", "K")
+            await hot.domains.create({"domain": "example.com"})
+            await hot.domains.list()
+            await hot.domains.get("d1")
+            await hot.domains.verify("d1")
+            await hot.domains.delete("d1")
+            await hot.sessions.create({"permissions": {}})
+            await hot.sessions.list()
+            await hot.sessions.revoke("s1")
+            await hot.sessions.revoke_all()
+            await hot.service_keys.create({"name": "CI", "permissions": {}})
+            await hot.service_keys.list()
+            await hot.service_keys.get("sk1")
+            await hot.service_keys.update("sk1", {"metadata": {}})
+            await hot.service_keys.revoke("sk1")
+            await hot.service_keys.revoke_all()
+            await hot.files.list()
+            await hot.files.get("f1")
+            await hot.files.delete("f1")
+            await hot.files.download("f1")
+            await hot.files.upload("/notes/today.txt", b"hello")
+            await hot.files.initiate_upload({"path": "big.bin"})
+            await hot.files.upload_part("u1", 1, b"part")
+            await hot.files.complete_upload("u1")
+            await hot.files.abort_upload("u1")
+
+    asyncio.run(scenario())
+    assert ("PUT", "/v1/files/upload/notes/today.txt") in seen
+    assert ("DELETE", "/v1/projects/demo") in seen
+    assert ("DELETE", "/v1/files/f1") in seen
+    assert ("DELETE", "/v1/files/uploads/u1") in seen
+
+
+@pytest.mark.parametrize(
+    "open_stream",
+    [
+        lambda hot: hot.runs.subscribe("r1"),
+        lambda hot: hot.env.subscribe(),
+        lambda hot: hot.streams.subscribe("s1"),
+        lambda hot: hot.streams.subscribe_post("s1"),
+        lambda hot: hot.streams.subscribe_with_event({"event_type": "x"}, reconnect=False),
+        lambda hot: hot.tasks.subscribe("t1"),
+    ],
+    ids=[
+        "runs.subscribe",
+        "env.subscribe",
+        "streams.subscribe",
+        "streams.subscribe_post",
+        "streams.subscribe_with_event(reconnect=False)",
+        "tasks.subscribe",
+    ],
+)
+def test_async_stream_wrappers_close_inner_response_immediately_on_early_exit(open_stream):
+    class TrackingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"type":"stream:data","n":1}\n\n'
+            yield b'data: {"type":"stream:data","n":2}\n\n'
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    body = TrackingStream()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body, headers={"content-type": "text/event-stream"})
+
+    async def scenario() -> None:
+        async with AsyncHotClient(
+            token="test-token",
+            base_url="https://api.example.test",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        ) as hot:
+            async with aclosing(open_stream(hot)) as events:
+                first = await events.__anext__()
+                assert first == {"type": "stream:data", "n": 1}
+                assert not body.closed
+            # Must be closed immediately on exiting aclosing (not deferred to GC).
+            assert body.closed
+
+    asyncio.run(scenario())

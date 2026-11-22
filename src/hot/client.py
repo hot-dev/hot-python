@@ -83,6 +83,9 @@ class HotClient:
         self.streams = StreamsResource(self._transport)
         self.tasks = TasksResource(self._transport)
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(base_url={self._transport.base_url!r}, token='***')"
+
     @property
     def token(self) -> str:
         return self._transport.token
@@ -90,6 +93,15 @@ class HotClient:
     @property
     def api_base_url(self) -> str:
         return self._transport.api_base_url
+
+    def status(self) -> dict[str, Any]:
+        """Return API server status from ``GET /status`` (unauthenticated)."""
+        return self._transport.request_json(
+            "GET",
+            "/status",
+            authenticated=False,
+            versioned=False,
+        )
 
     def request(
         self,
@@ -99,7 +111,7 @@ class HotClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Call a JSON API endpoint that does not yet have a resource helper."""
+        """Call a ``/v1`` JSON API endpoint that does not yet have a resource helper."""
         return self._transport.request_json(method, path, json=json, params=params)
 
     def request_raw(
@@ -108,7 +120,7 @@ class HotClient:
         path: str,
         **kwargs: Any,
     ) -> httpx.Response:
-        """Call an API endpoint and return the raw HTTP response."""
+        """Call a ``/v1`` API endpoint and return the raw HTTP response."""
         return self._transport.request_raw(method, path, **kwargs)
 
     def close(self) -> None:
@@ -155,6 +167,9 @@ class AsyncHotClient:
         self.streams = AsyncStreamsResource(self._transport)
         self.tasks = AsyncTasksResource(self._transport)
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(base_url={self._transport.base_url!r}, token='***')"
+
     @property
     def token(self) -> str:
         return self._transport.token
@@ -162,6 +177,15 @@ class AsyncHotClient:
     @property
     def api_base_url(self) -> str:
         return self._transport.api_base_url
+
+    async def status(self) -> dict[str, Any]:
+        """Return API server status from ``GET /status`` (unauthenticated)."""
+        return await self._transport.request_json(
+            "GET",
+            "/status",
+            authenticated=False,
+            versioned=False,
+        )
 
     async def request(
         self,
@@ -171,7 +195,7 @@ class AsyncHotClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Call a JSON API endpoint that does not yet have a resource helper."""
+        """Call a ``/v1`` JSON API endpoint that does not yet have a resource helper."""
         return await self._transport.request_json(method, path, json=json, params=params)
 
     async def request_raw(
@@ -180,7 +204,7 @@ class AsyncHotClient:
         path: str,
         **kwargs: Any,
     ) -> httpx.Response:
-        """Call an API endpoint and return the raw HTTP response."""
+        """Call a ``/v1`` API endpoint and return the raw HTTP response."""
         return await self._transport.request_raw(method, path, **kwargs)
 
     async def aclose(self) -> None:
