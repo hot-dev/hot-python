@@ -34,7 +34,7 @@ Issues = "https://github.com/hot-dev/hot-python/issues"
 dev = [
   "build==1.6.1",
   "pytest==9.2.0",
-  "ruff==0.17.5",
+  "ruff==0.17.6",
 ]
 
 [tool.hatch.build.targets.wheel]
