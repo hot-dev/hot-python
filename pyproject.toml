@@ -45,7 +45,7 @@ Issues = "https://github.com/hot-dev/hot-python/issues"
 # Pinned so CI and releases use reviewed tool versions; Dependabot bumps them.
 dev = [
   "build==1.6.1",
-  "mypy==1.15.0",
+  "mypy==2.4.1",
   "pytest==9.2.0",
   "ruff==0.17.6",
 ]
